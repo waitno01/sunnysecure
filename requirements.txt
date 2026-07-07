@@ -1,0 +1,14 @@
+py-cord
+httpx
+millify
+python-dateutil
+audioop-lts
+fake-useragent
+aiosmtpd
+requests
+fastapi
+uvicorn
+PyJWT
+python-multipart
+slowapi
+argon2-cffi

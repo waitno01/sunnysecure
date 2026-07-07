@@ -1,0 +1,13 @@
+
+tunnel: autosecure
+# Do 'cloudflared tunnel list' to get the ID bellow
+# Linux:   /home/<user>/.cloudflared/<your-tunnel-id>.json
+# Windows: C:\Users\<user>\.cloudflared\<your-tunnel-id>.json
+credentials-file: "<your_path>"
+ingress:
+  - hostname: <your_domain>
+    path: /api/
+    service: http://localhost:8000
+  - hostname: <your_domain>
+    service: http://localhost:3000
+  - service: http_status:404
