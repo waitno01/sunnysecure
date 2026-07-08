@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useLayoutEffect, useCallback } from "react
 import { ReactSkinview3d } from "react-skinview3d";
 import {
   Search, Download, Check, Copy, Link2, Lock, X, Power, ArrowLeft,
-  Loader2, RotateCcw, Mail, ChevronRight,
+  Loader2, RotateCcw, Mail, ChevronRight, Trash2,
 } from "lucide-react";
 import { toast } from "sonner";
 import { cn, simplify } from "@/lib/utils";
@@ -489,7 +489,7 @@ function GameStatsSection({ accountId, mcName }: { accountId: string; mcName?: s
   );
 }
 
-function AccountDetail({ account, onBack }: { account: Account; onBack: () => void }) {
+function AccountDetail({ account, onBack, onDeleted }: { account: Account; onBack: () => void; onDeleted: () => void }) {
   const [detail, setDetail] = useState<Account>(account);
   const [emails, setEmails] = useState<EmailEntry[]>([]);
   const [showMail, setShowMail] = useState(false);
@@ -500,6 +500,30 @@ function AccountDetail({ account, onBack }: { account: Account; onBack: () => vo
   const [showShareModal, setShowShareModal] = useState(false);
   const [shareLinks, setShareLinks] = useState<any[]>([]);
   const [domain, setDomain] = useState("securings.fun");
+  const [deleting, setDeleting] = useState(false);
+
+  async function handleDelete() {
+    const label = detail.mc_name || detail.ms_email || "this account";
+    if (!window.confirm(`Delete ${label} from the database? This cannot be undone.`)) return;
+    setDeleting(true);
+    try {
+      const res = await fetch(`/api/accounts/${account.account_id}`, {
+        method: "DELETE",
+        headers: authHeaders(),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => null);
+        throw new Error(err?.detail || "Failed to delete account.");
+      }
+      toast.success("Account deleted");
+      onDeleted();
+      onBack();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to delete account.");
+    } finally {
+      setDeleting(false);
+    }
+  }
 
   useLayoutEffect(() => {
     const el = skinRef.current;
@@ -648,6 +672,14 @@ function AccountDetail({ account, onBack }: { account: Account; onBack: () => vo
               >
                 <Link2 className="h-3 w-3" />
                 Generate Link
+              </button>
+              <button
+                onClick={handleDelete}
+                disabled={deleting}
+                style={{ display: "inline-flex", alignItems: "center", gap: "0.35rem", padding: "0.35rem 0.75rem", fontSize: "0.7rem", fontWeight: 600, borderRadius: "6px", border: "1px solid color-mix(in oklab, #ef4444 40%, transparent)", background: "color-mix(in oklab, #ef4444 12%, transparent)", color: "#ef4444", cursor: deleting ? "not-allowed" : "pointer", opacity: deleting ? 0.6 : 1, transition: "all 0.2s" }}
+              >
+                {deleting ? <Loader2 className="h-3 w-3 animate-spin" /> : <Trash2 className="h-3 w-3" />}
+                Delete
               </button>
             </div>
           </div>
@@ -907,6 +939,7 @@ export function Accounts() {
   const [selected, setSelected] = useState<Account | null>(null);
   const [showHits, setShowHits] = useState(false);
   const [showExport, setShowExport] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const prevCount = useRef(0);
   const { addNotification } = useNotifications();
 
@@ -927,6 +960,30 @@ export function Accounts() {
     return () => clearInterval(interval);
   }, []);
 
+  async function deleteAccount(account: Account, e?: React.MouseEvent) {
+    e?.stopPropagation();
+    const label = account.mc_name || account.ms_email || "this account";
+    if (!window.confirm(`Delete ${label} from the database? This cannot be undone.`)) return;
+    setDeletingId(account.account_id);
+    try {
+      const res = await fetch(`/api/accounts/${account.account_id}`, {
+        method: "DELETE",
+        headers: authHeaders(),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => null);
+        throw new Error(err?.detail || "Failed to delete account.");
+      }
+      setAccounts(prev => prev.filter(a => a.account_id !== account.account_id));
+      prevCount.current = Math.max(0, prevCount.current - 1);
+      toast.success("Account deleted");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to delete account.");
+    } finally {
+      setDeletingId(null);
+    }
+  }
+
   const hits = accounts.filter(a => !a.mc_name);
   const filtered = (search.trim() ? accounts : (showHits ? hits : accounts)).filter(a =>
     a.ms_email?.toLowerCase().includes(search.toLowerCase()) ||
@@ -934,7 +991,16 @@ export function Accounts() {
   );
 
   if (selected) {
-    return <AccountDetail account={selected} onBack={() => setSelected(null)} />;
+    return (
+      <AccountDetail
+        account={selected}
+        onBack={() => setSelected(null)}
+        onDeleted={() => {
+          setAccounts(prev => prev.filter(a => a.account_id !== selected.account_id));
+          prevCount.current = Math.max(0, prevCount.current - 1);
+        }}
+      />
+    );
   }
 
   return (
@@ -1003,8 +1069,36 @@ export function Accounts() {
       ) : (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(250px, 1fr))", gap: "1rem" }}>
           {filtered.map((a, i) => (
-            <div key={a.account_id} className="db-acct-card animate-in fade-in slide-in-from-bottom-3 duration-500" onClick={() => setSelected(a)} style={{ animationDelay: `${i * 60}ms` }}>
-              <div className="db-acct-img-section">
+            <div key={a.account_id} className="db-acct-card group relative animate-in fade-in slide-in-from-bottom-3 duration-500" onClick={() => setSelected(a)} style={{ animationDelay: `${i * 60}ms` }}>
+              <div className="db-acct-img-section" style={{ position: "relative" }}>
+                <button
+                  type="button"
+                  title="Delete account"
+                  onClick={e => deleteAccount(a, e)}
+                  disabled={deletingId === a.account_id}
+                  style={{
+                    position: "absolute",
+                    right: "0.5rem",
+                    top: "0.5rem",
+                    zIndex: 10,
+                    display: "grid",
+                    placeItems: "center",
+                    width: "1.75rem",
+                    height: "1.75rem",
+                    borderRadius: "0.375rem",
+                    border: "1px solid color-mix(in oklab, #ef4444 35%, transparent)",
+                    background: "color-mix(in oklab, var(--background) 85%, transparent)",
+                    color: "#ef4444",
+                    cursor: deletingId === a.account_id ? "not-allowed" : "pointer",
+                    opacity: deletingId === a.account_id ? 0.5 : 0.85,
+                  }}
+                >
+                  {deletingId === a.account_id ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Trash2 className="h-3.5 w-3.5" />
+                  )}
+                </button>
                 <img
                   src={`https://mc-heads.net/player/${a.mc_name || "MHF_Steve"}`}
                   alt={a.mc_name}

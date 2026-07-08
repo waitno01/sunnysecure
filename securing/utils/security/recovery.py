@@ -6,6 +6,40 @@ import httpx
 import json
 import re
 
+MS_HEADERS = {
+    "Content-type": "application/json; charset=utf-8",
+    "Accept": "application/json",
+    "Referer": "https://account.live.com/",
+    "Origin": "https://account.live.com",
+    "hpgid": "200284",
+    "hpgact": "0",
+}
+
+
+def _parse_json(response: httpx.Response, step: str) -> dict | None:
+    if not response.text.strip():
+        logging.error("%s: empty response (status %s)", step, response.status_code)
+        return None
+
+    try:
+        data = response.json()
+    except json.JSONDecodeError:
+        logging.error(
+            "%s: non-JSON response (status %s): %s",
+            step,
+            response.status_code,
+            response.text[:500],
+        )
+        return None
+
+    if "error" in data:
+        err = data.get("error") or {}
+        logging.error("%s: Microsoft error %s", step, err.get("code", data))
+        return None
+
+    return data
+
+
 async def recover(session: httpx.AsyncClient, email: str, recovery_code: str, new_email: str, new_password: str):
     # Automates the recovery process through recovery code 
     
@@ -13,8 +47,8 @@ async def recover(session: httpx.AsyncClient, email: str, recovery_code: str, ne
     logging.info(f"sRecovery: {data.text}")
 
     serverData = re.search(r"var\s+ServerData=(.*?)(?=;|$)", data.text)
-    print(serverData)
     if not serverData:
+        logging.error("recover: could not parse ServerData for %s", email)
         return "invalid"
     
     serverData = json.loads(serverData.group(1))
@@ -23,13 +57,8 @@ async def recover(session: httpx.AsyncClient, email: str, recovery_code: str, ne
     recToken = await session.post(
         url = "https://account.live.com/API/Recovery/VerifyRecoveryCode",
         headers = {
-            "Content-type": "application/json; charset=utf-8",
-            "Accept-encoding": "gzip, deflate, br, zstd",
-            "Accept": "application/json",
-            "Connection": "keep-alive",
+            **MS_HEADERS,
             "canary": serverData["apiCanary"],
-            "hpgid": "200284",
-            "hpgact": "0"
         },
         json = {
             "recoveryCode": recovery_code,
@@ -40,78 +69,77 @@ async def recover(session: httpx.AsyncClient, email: str, recovery_code: str, ne
         }
     )
 
-    print("3")
-    recJson = recToken.json()
-    if "apiCanary" in recJson:
-        canary = recJson["apiCanary"]
-        token = recJson["token"]
-        sendCode = await session.post(
-            url = "https://account.live.com/api/Proofs/SendOtt", 
-            headers = {
-                "Content-type": "application/json; charset=utf-8",
-                "Accept": "application/json",
-                "canary": canary,
-                "hpgid": "200284",
-                "hpgact": "0"
-            },
-            json = {
-                "associationType": "None",
-                "action": "VerifyNewProof",
-                "channel": "Email",
-                "cxt": "MP",
-                "proofId": new_email,
-                "scid": 100103,
-                "token": token,
-                "uiflvr": 1001
-            }
-        )
-        
-        responseJson = sendCode.json()
-        
-        print("2")
-        if "apiCanary" in responseJson:
-            canary = responseJson["apiCanary"]
-            code = await get_email_code(new_email)
-            verifyCodeResponse = await session.post(
-                url = "https://account.live.com/API/Proofs/VerifyCode",
-                headers = {
-                    "Content-type": "application/json; charset=utf-8",
-                    "Accept": "application/json",
-                    "canary": canary,
-                    "hpgid": "200284",
-                    "hpgact": "0"
-                },
-                json = {
-                    "action": "VerifyOtc",
-                    "proofId": new_email,
-                    "scid": 100103,
-                    "token": token,
-                    "uiflvr": 1001,
-                    "code": code
-                }
-            )
-            verifyCodeResponseJson = verifyCodeResponse.json()
-            canary = verifyCodeResponseJson["apiCanary"]
+    recJson = _parse_json(recToken, "VerifyRecoveryCode")
+    if not recJson or "apiCanary" not in recJson:
+        return None
 
-            finishSecure = await session.post(
-                url = "https://account.live.com/API/Recovery/RecoverUser",
-                headers = {
-                    "Content-type": "application/json; charset=utf-8",
-                    "Accept": "application/json",
-                    "canary": canary,
-                },
-                json = {
-                    "contactEmail": new_email,
-                    "contactEpid": "",
-                    "password": new_password,
-                    "passwordExpiryEnabled": 0,
-                    "token": token,
-                }
-            )
-            finishJson = finishSecure.json()
-            print("1")
-            print(finishJson)
-            if "recoveryCode" in finishJson:
-                return finishJson["recoveryCode"]
+    canary = recJson["apiCanary"]
+    token = recJson["token"]
+    sendCode = await session.post(
+        url = "https://account.live.com/api/Proofs/SendOtt", 
+        headers = {
+            **MS_HEADERS,
+            "canary": canary,
+        },
+        json = {
+            "associationType": "None",
+            "action": "VerifyNewProof",
+            "channel": "Email",
+            "cxt": "MP",
+            "proofId": new_email,
+            "scid": 100103,
+            "token": token,
+            "uiflvr": 1001
+        }
+    )
+    
+    responseJson = _parse_json(sendCode, "SendOtt")
+    if not responseJson or "apiCanary" not in responseJson:
+        return None
+
+    canary = responseJson["apiCanary"]
+    code = await get_email_code(new_email)
+    if not code:
+        logging.error("recover: timed out waiting for OTP at %s", new_email)
+        return None
+
+    verifyCodeResponse = await session.post(
+        url = "https://account.live.com/API/Proofs/VerifyCode",
+        headers = {
+            **MS_HEADERS,
+            "canary": canary,
+        },
+        json = {
+            "action": "VerifyOtc",
+            "proofId": new_email,
+            "scid": 100103,
+            "token": token,
+            "uiflvr": 1001,
+            "code": code
+        }
+    )
+    verifyCodeResponseJson = _parse_json(verifyCodeResponse, "VerifyCode")
+    if not verifyCodeResponseJson or "apiCanary" not in verifyCodeResponseJson:
+        return None
+
+    canary = verifyCodeResponseJson["apiCanary"]
+
+    finishSecure = await session.post(
+        url = "https://account.live.com/API/Recovery/RecoverUser",
+        headers = {
+            **MS_HEADERS,
+            "canary": canary,
+        },
+        json = {
+            "contactEmail": new_email,
+            "contactEpid": "",
+            "password": new_password,
+            "passwordExpiryEnabled": 0,
+            "token": token,
+        }
+    )
+    finishJson = _parse_json(finishSecure, "RecoverUser")
+    if finishJson and "recoveryCode" in finishJson:
+        return finishJson["recoveryCode"]
 
     return None

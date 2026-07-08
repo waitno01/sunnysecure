@@ -1,15 +1,13 @@
 from database.database import DBConnection
 import asyncio
-import httpx
-import json
 import re
+import time
 
-config = json.load(open("config/config.json", "r"))
 
-async def get_email_code(mail: str) -> str:
+async def get_email_code(mail: str, timeout: float = 120) -> str | None:
+    deadline = time.monotonic() + timeout
 
-    while True:
-
+    while time.monotonic() < deadline:
         with DBConnection() as db:
             row = db.mark_unused(mail)
 
@@ -20,5 +18,7 @@ async def get_email_code(mail: str) -> str:
                 with DBConnection() as db:
                     db.mark_used(email_id)
                 return match.group(1)
-            
+
         await asyncio.sleep(0.8)
+
+    return None

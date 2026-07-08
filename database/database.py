@@ -196,6 +196,15 @@ class DBConnection:
         """, (account_id,)).fetchone()
         return result is not None
 
+    def delete_secured_account(self, account_id: str) -> bool:
+        if not self.is_valid_account_id(account_id):
+            return False
+        self.cursor.execute("DELETE FROM stats WHERE account_id = ?", (account_id,))
+        self.cursor.execute("DELETE FROM shared_links WHERE account_id = ?", (account_id,))
+        self.cursor.execute("DELETE FROM secured_accounts WHERE account_id = ?", (account_id,))
+        self.conn.commit()
+        return True
+
     # Web Methods
     def get_all_secured_accounts(self) -> list:
         rows = self.cursor.execute("""

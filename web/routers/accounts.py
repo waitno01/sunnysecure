@@ -24,6 +24,13 @@ def account_detail(account_id: str, user: str = Depends(require_auth)):
         
         return row
 
+@router.delete("/api/accounts/{account_id}")
+def delete_account(account_id: str, user: str = Depends(require_auth)):
+    with DBConnection() as db:
+        if not db.delete_secured_account(account_id):
+            raise HTTPException(404, detail="Account not found.")
+        return {"ok": True}
+
 @router.get("/api/accounts/{account_id}/stats")
 async def account_stats(account_id: str, user: str = Depends(require_auth)):
     with DBConnection() as db:

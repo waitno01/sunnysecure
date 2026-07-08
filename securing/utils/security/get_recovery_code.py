@@ -46,7 +46,7 @@ async def get_recovery_code(session: httpx.AsyncClient, apicanary: str, eni: str
     response = await generate_code(session, apicanary, eni)
 
     # Missing alias verification
-    if "error" in response and response["error"]["code"] == 500:
+    if "error" in response and str(response["error"].get("code")) == "500":
         print("[~] - Verifying security email")
         
         security_info = await session.get("https://account.live.com/proofs/Manage/additional")
@@ -110,4 +110,7 @@ async def get_recovery_code(session: httpx.AsyncClient, apicanary: str, eni: str
 
         response = await generate_code(session, canary, eni)
 
-    return response["recoveryCode"]
+    code = response.get("recoveryCode")
+    if not code:
+        logging.warning("GenerateRecoveryCode did not return recoveryCode: %s", response)
+    return code

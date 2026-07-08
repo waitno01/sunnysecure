@@ -1,10 +1,11 @@
-from securing.auth.handle_redirects import handle_redirects
+from securing.auth.handle_redirects import handle_redirects, get_data
+from securing.auth.account_status import get_account_lock_reason
 from urllib.parse import quote
 import logging
 import httpx
 import re
 
-async def get_msaauth(session: httpx.AsyncClient, email: str, flowtoken: str, odata: dict, code: str, ppft: str = None) -> dict | None:
+async def get_msaauth(session: httpx.AsyncClient, email: str, flowtoken: str, odata: dict, code: str, ppft: str = None) -> dict | str | None:
     # First post request that gets __Host-MSAAUTH
     
     if not code:
@@ -84,16 +85,39 @@ async def get_msaauth(session: httpx.AsyncClient, email: str, flowtoken: str, od
 
     if '__Host-MSAAUTH' in session.cookies:
         logging.info(f"MSAAUTH cookie for {email}: {dict(session.cookies)['__Host-MSAAUTH']}")
-        
+
         if not urlPost:
             data = await handle_redirects(session, loginData.text)
-            return data
-        
-        ppft = quote(re.search(r'"sFT"\s*:\s*"([^"]+)"', loginData.text).group(1), safe='-*')
+            if data == "Family":
+                return "Family"
+            if isinstance(data, dict) and data.get("urlPost"):
+                return data
+            parsed = get_data(loginData.text)
+            if parsed:
+                return parsed
+            lock_reason = await get_account_lock_reason(email, loginData.text)
+            if lock_reason:
+                return {"_error": lock_reason}
+            return {"_error": "MSAAUTH obtained but post-login redirect could not be parsed (unknown login page)."}
+
+        sft_match = re.search(r'"sFT"\s*:\s*"([^"]+)"', loginData.text)
+        if not sft_match:
+            data = await handle_redirects(session, loginData.text)
+            if isinstance(data, dict):
+                return data
+            lock_reason = await get_account_lock_reason(email, loginData.text)
+            if lock_reason:
+                return {"_error": lock_reason}
+            return {"_error": "MSAAUTH obtained but login page did not include sFT token."}
+
+        ppft = quote(sft_match.group(1), safe='-*')
 
         return {
             "urlPost" : urlPost.group(1),
             "ppft": ppft
         }
-    
-    return None
+
+    lock_reason = await get_account_lock_reason(email, loginData.text)
+    if lock_reason:
+        return {"_error": lock_reason}
+    return {"_error": "Login failed — no MSAAUTH cookie (wrong/expired OTP or Microsoft rejected login)."}

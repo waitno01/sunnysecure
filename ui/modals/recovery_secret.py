@@ -29,7 +29,7 @@ class recoveryAuthModal(ui.Modal):
 
         account = await recovery_secure(
             email = email, 
-            type = "authpwd", 
+            method = "authpwd", 
             data = {
                 "password": password, 
                 "auth_secret": auth_secret

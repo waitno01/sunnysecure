@@ -15,9 +15,7 @@
       "set_channel": true,
       "stats": true
     },
-    "fake": {
-
-    },
+    "fake": {},
     "aliases": {
       "auth_code": "auth_code",
       "check_lock": "check",
@@ -66,8 +64,8 @@
     }
   },
   "presence": {
-    "status": "dnd",
-    "activity_text": "",
+    "status": "online",
+    "activity_text": "Minecraft Linker!",
     "activity_type": "playing"
   },
   "verification_button": {
@@ -75,9 +73,7 @@
     "color": "primary"
   },
   "post_verification": {
-    "actions": [
-
-    ]
+    "actions": []
   },
   "ephemeral": false
 }

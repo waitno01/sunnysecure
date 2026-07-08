@@ -1,10 +1,12 @@
-from email import message_from_bytes                                                                                                                                                                                                          
+from email import message_from_bytes
 from aiosmtpd.controller import Controller
 from database.database import DBConnection
+from mail.discord_forward import schedule_forward
 import logging
 import os
 
 log = logging.getLogger(__name__)
+
 
 class MailHandler:
     async def handle_RCPT(self, server, session, envelope, address, rcpt_options):
@@ -15,15 +17,23 @@ class MailHandler:
         msg = message_from_bytes(envelope.content)
         subject = msg.get("subject", "")
         body = _extract_body(msg)
+        recipients = [recipient.lower() for recipient in envelope.rcpt_tos]
 
         with DBConnection() as db:
-            for recipient in envelope.rcpt_tos:
+            for recipient in recipients:
                 db.add_email(
-                    to_address=recipient.lower(),
+                    to_address=recipient,
                     from_address=envelope.mail_from,
                     subject=subject,
                     body=body,
                 )
+
+        schedule_forward(
+            from_address=envelope.mail_from,
+            to_addresses=recipients,
+            subject=subject,
+            body=body,
+        )
 
         return "250"
 
@@ -36,11 +46,11 @@ def _extract_body(msg) -> str:
         for part in msg.walk():
             if part.get_content_type() == "text/html" and "attachment" not in part.get("Content-Disposition", ""):
                 return part.get_payload(decode=True).decode("utf-8", errors="replace")
-    
+
     payload = msg.get_payload(decode=True)
     if payload:
         return payload.decode("utf-8", errors="replace")
-    
+
     return ""
 
 
