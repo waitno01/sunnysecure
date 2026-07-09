@@ -1,4 +1,4 @@
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urljoin
 import logging
 import httpx
 import re
@@ -18,6 +18,124 @@ def get_data(response: str) -> dict | None:
         "urlPost": urlPost.group(1),
         "ppft": quote(ppft.group(1), safe='-*')
     }
+
+
+def _is_proofs_interstitial(html: str, url: str = "") -> bool:
+    combined = f"{html} {url}".lower()
+    if "account.live.com/proofs" in combined:
+        return True
+    if "overprotective" in html.lower():
+        return True
+    if "frmaddproof" in html.lower():
+        return True
+    return False
+
+
+def _extract_form_fields(html: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for tag in re.findall(r"<input[^>]+>", html, re.I):
+        name_m = re.search(r'name="([^"]+)"', tag, re.I)
+        if not name_m:
+            continue
+        val_m = re.search(r'value="([^"]*)"', tag, re.I)
+        fields[name_m.group(1)] = val_m.group(1) if val_m else ""
+    return fields
+
+
+def _extract_form_action(html: str, fallback_url: str = "") -> str | None:
+    for pattern in (
+        r'<form[^>]*id="frmAddProof"[^>]*action="([^"]+)"',
+        r'<form[^>]*action="([^"]+)"',
+    ):
+        match = re.search(pattern, html, re.I)
+        if match:
+            action = match.group(1).replace("&amp;", "&")
+            if action.startswith("http"):
+                return action
+            return urljoin(fallback_url or "https://account.live.com/", action)
+    return fallback_url or None
+
+
+def _find_proof_option(html: str) -> str | None:
+    for pattern in (
+        r'name="iProofOptions"[^>]*value="([^"]+)"',
+        r'value="(OTT\|\|[^"]+)"',
+    ):
+        match = re.search(pattern, html, re.I)
+        if match:
+            return match.group(1)
+    return None
+
+
+async def skip_proofs_page(session: httpx.AsyncClient, html: str, page_url: str) -> str | None:
+    if not _is_proofs_interstitial(html, page_url):
+        return None
+
+    action = _extract_form_action(html, page_url)
+    if not action:
+        return None
+
+    fields = _extract_form_fields(html)
+    fields["action"] = "Skip"
+    fields.setdefault("iOttText", "")
+
+    proof_option = _find_proof_option(html)
+    if proof_option:
+        fields["iProofOptions"] = proof_option
+
+    if "canary" not in fields:
+        canary_match = re.search(r'"canary"\s*:\s*"([^"]+)"', html)
+        if canary_match:
+            fields["canary"] = canary_match.group(1)
+
+    print("[~] - Skipping proofs interstitial (overprotective / verify)")
+    response = await session.post(action, data=fields, follow_redirects=False)
+
+    for _ in range(10):
+        if response.status_code not in (301, 302, 303, 307, 308):
+            break
+        location = response.headers.get("location")
+        if not location:
+            break
+        if not location.startswith("http"):
+            location = urljoin(str(response.url), location)
+        response = await session.get(location, follow_redirects=True)
+
+    return response.text
+
+
+async def resolve_proofs_interstitials(
+    session: httpx.AsyncClient,
+    html: str,
+    page_url: str = "",
+) -> str:
+    text = html
+    url = page_url
+
+    for _ in range(6):
+        if not _is_proofs_interstitial(text, url):
+            break
+
+        if "pprid" in text and re.search(r'action="[^"]*proofs', text, re.I):
+            action_match = re.search(r'action="([^"]+)"', text)
+            if action_match:
+                action_url = action_match.group(1).replace("&amp;", "&")
+                print("[~] - Submitting pprid form to proofs page")
+                text = await submit_form(session, action_url, text)
+                url = action_url
+                continue
+
+        skipped = await skip_proofs_page(session, text, url)
+        if skipped and skipped != text:
+            text = skipped
+            url = ""
+            if get_data(text):
+                return text
+            continue
+
+        break
+
+    return text
 
 async def submit_form(session: httpx.AsyncClient, action_url: str, redirect: str) -> str:
     pprid = re.search(r'name="pprid"[^>]+value="([^"]+)"', redirect).group(1)
@@ -121,6 +239,18 @@ async def handle_redirects(session: httpx.AsyncClient, response: str) -> dict | 
                 return get_data(response2.text)
 
             result = redirect
+            result = await resolve_proofs_interstitials(session, result, action_url)
+
+        elif "account.live.com/proofs" in action_url:
+            print("[~] - Handling proofs interstitial")
+            if "pprid" in response:
+                result = await submit_form(session, action_url, response)
+            else:
+                result = response
+            result = await resolve_proofs_interstitials(session, result, action_url)
+
+        if _is_proofs_interstitial(result, action_url):
+            result = await resolve_proofs_interstitials(session, result, action_url)
 
         parsed = get_data(result)
         if parsed:

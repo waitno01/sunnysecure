@@ -32,22 +32,46 @@ def lock_reason_from_check_api(info: dict | None) -> str | None:
         return None
 
     status_code = info.get("StatusCode")
-    if status_code is None or status_code == 500:
+    if status_code is None or status_code >= 500:
         return None
 
     value_raw = info.get("Value")
-    if value_raw:
-        try:
-            value_data = json.loads(value_raw)
-            status = value_data.get("status", {})
-            if status.get("isAccountSuspended"):
-                return "Account is suspended/locked by Microsoft"
-            if status.get("isPhoneLocked"):
-                return "Account is phone-locked (phone verification required)"
-        except (json.JSONDecodeError, KeyError, TypeError):
-            pass
+    if not value_raw:
+        return None
 
-    return "Account appears locked or restricted by Microsoft"
+    try:
+        value_data = json.loads(value_raw)
+        status = value_data.get("status", {})
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
+
+    if status.get("notFound") or status.get("doesAccountExist") is False:
+        return "Account does not exist or email is invalid"
+
+    if status.get("isAccountSuspended"):
+        reason = status.get("reasonForAccountSuspension") or ""
+        if reason:
+            return f"Account is suspended by Microsoft ({reason})"
+        return "Account is suspended/locked by Microsoft"
+
+    if status.get("isPhoneLocked"):
+        return "Account is phone-locked (phone verification required)"
+
+    if status.get("isAccountBlocked"):
+        return "Account is blocked from signing in"
+
+    if status.get("isAccountInLostProofState"):
+        return "Account is in lost-proof state (recovery proofs missing)"
+
+    if status.get("isUnFamiliarLocationBlockSet"):
+        return "Account is blocked due to unfamiliar location"
+
+    if status.get("isAccountCompromised"):
+        return "Account is flagged as compromised by Microsoft"
+
+    # isIssuePresent / isAccountInFailedLoginState are soft flags (often from
+    # recent failed OTP attempts) — do not treat as locked.
+    return None
 
 
 async def get_account_lock_reason(email: str, login_html: str | None = None) -> str | None:

