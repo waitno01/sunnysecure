@@ -138,49 +138,61 @@ async def resolve_proofs_interstitials(
     return text
 
 async def submit_form(session: httpx.AsyncClient, action_url: str, redirect: str) -> str:
-    pprid = re.search(r'name="pprid"[^>]+value="([^"]+)"', redirect).group(1)
-    ipt = re.search(r'name="ipt"[^>]+value="([^"]+)"', redirect).group(1)
-    
+    pprid_m = re.search(r'name="pprid"[^>]+value="([^"]+)"', redirect)
+    ipt_m = re.search(r'name="ipt"[^>]+value="([^"]+)"', redirect)
+    if not pprid_m or not ipt_m:
+        raise RuntimeError("Continue/passkey form missing pprid/ipt fields.")
+
     response = await session.post(
-        url = action_url,
-        data = {
-            "pprid": pprid,
-            "ipt": ipt
+        url=action_url,
+        data={
+            "pprid": pprid_m.group(1),
+            "ipt": ipt_m.group(1),
         },
-        follow_redirects=True
+        follow_redirects=True,
     )
-    rtext = response.text
-    return rtext
+    return response.text
 
 # FIDO Passkey interruption
 async def handle_fido(session: httpx.AsyncClient, redirect: str) -> dict:
-    postBackUrl = re.search(r"""name=['"]postBackUrl['"]\s+value=['"]([^'"]+)['"]""", redirect).group(1)
-    formatURL = postBackUrl.replace('&amp;', '&')
+    post_m = re.search(
+        r"""name=['"]postBackUrl['"]\s+value=['"]([^'"]+)['"]""",
+        redirect,
+    )
+    if not post_m:
+        raise RuntimeError("FIDO interrupt page missing postBackUrl.")
+    formatURL = post_m.group(1).replace("&amp;", "&")
 
-    ru = re.search(r'[?&]ru=([^&"]+)', formatURL).group(1)
-    
-    response = await session.get(unquote(ru), follow_redirects=True)
+    ru_m = re.search(r'[?&]ru=([^&"]+)', formatURL)
+    if not ru_m:
+        raise RuntimeError("FIDO postBackUrl missing ru= parameter.")
 
+    response = await session.get(unquote(ru_m.group(1)), follow_redirects=True)
     return response.text
 
 # Accept Notice Form
 async def handle_notice(session: httpx.AsyncClient, action_url: str, redirect: str) -> str:
-    cid, actioncode = re.search(
+    notice_m = re.search(
         r'id="correlation_id"\s+value="([^"]+)".*?id="code"\s+value="([^"]+)"',
         redirect,
-        re.DOTALL
-    ).groups()
-    
-    acceptNotice = await session.post(
-        url = action_url,
-        data = {
-            "correlation_id": cid,
-            "code": actioncode
-        }
+        re.DOTALL,
     )
-    postURL = re.search(r"var redirectUrl = '([^']+)';", acceptNotice.text).group(1).replace(r"\\u0026", "&")
-    response = await session.post(postURL)
+    if not notice_m:
+        raise RuntimeError("Privacy notice form missing correlation_id/code.")
+    cid, actioncode = notice_m.groups()
 
+    acceptNotice = await session.post(
+        url=action_url,
+        data={
+            "correlation_id": cid,
+            "code": actioncode,
+        },
+    )
+    url_m = re.search(r"var redirectUrl = '([^']+)';", acceptNotice.text)
+    if not url_m:
+        raise RuntimeError("Privacy notice response missing redirectUrl.")
+    postURL = url_m.group(1).replace(r"\\u0026", "&")
+    response = await session.post(postURL)
     return response.text
 
 async def handle_redirects(session: httpx.AsyncClient, response: str) -> dict | str | None:

@@ -6,7 +6,7 @@ import discord
 
 from securing.build_embeds import build_failure_embed
 from ui.buttons.account_details import accountInfo
-from ui.modals.recovery_code import _send_failure_dm
+from ui.modals.recovery_code import _send_early_credentials, _send_failure_dm
 
 log = logging.getLogger(__name__)
 
@@ -16,10 +16,16 @@ T = TypeVar("T")
 async def _secure_one(
     user: discord.User | discord.Member,
     email: str,
-    secure_fn: Callable[[], Awaitable[T]],
+    secure_fn: Callable[..., Awaitable[T]],
 ) -> dict:
     try:
-        account = await secure_fn()
+        # Prefer early-credentials notify when the secure fn accepts it
+        try:
+            account = await secure_fn(
+                on_credentials=lambda creds: _send_early_credentials(user, creds),
+            )
+        except TypeError:
+            account = await secure_fn()
     except Exception as e:
         log.exception("recovery_secure crashed for %s during bulk", email)
         fail_embed = build_failure_embed(
@@ -41,6 +47,10 @@ async def _secure_one(
 
     if account == "invalid":
         return {"email": email, "status": "failure", "note": "invalid credentials"}
+
+    # Legacy callers sometimes returned a plain error string
+    if isinstance(account, str) and account not in ("", "invalid"):
+        return {"email": email, "status": "failure", "note": account[:120]}
 
     if not account:
         return {"email": email, "status": "failure", "note": "failed"}

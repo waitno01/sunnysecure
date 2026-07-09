@@ -1,5 +1,11 @@
 from securing.auth.handle_redirects import handle_redirects, get_data
 from securing.auth.account_status import get_account_lock_reason
+from securing.utils.cookies.safe_cookies import (
+    cookies_as_dict,
+    dedupe_cookies,
+    get_cookie,
+    has_cookie,
+)
 from urllib.parse import quote
 import logging
 import httpx
@@ -79,12 +85,14 @@ async def get_msaauth(session: httpx.AsyncClient, email: str, flowtoken: str, od
             print(f"Login attempt {i}")
             logging.info(f"Login attempt {i+1} response: {loginData.text}")
             urlPost = re.search(r'"urlPost"\s*:\s*"([^\"]+)"', loginData.text)
-            print(dict(session.cookies))
-            if '__Host-MSAAUTH' in session.cookies:
+            dedupe_cookies(session)
+            print(cookies_as_dict(session))
+            if has_cookie(session, "__Host-MSAAUTH"):
                 break
 
-    if '__Host-MSAAUTH' in session.cookies:
-        logging.info(f"MSAAUTH cookie for {email}: {dict(session.cookies)['__Host-MSAAUTH']}")
+    dedupe_cookies(session)
+    if has_cookie(session, "__Host-MSAAUTH"):
+        logging.info(f"MSAAUTH cookie for {email}: {get_cookie(session, '__Host-MSAAUTH')}")
 
         if not urlPost:
             data = await handle_redirects(session, loginData.text)

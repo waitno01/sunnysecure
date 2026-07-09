@@ -37,8 +37,8 @@ class BulkRecoveryCodeModal(ui.Modal):
             email, recovery_code = parts[0].strip(), parts[1].strip()
             jobs.append((
                 email,
-                lambda e=email, rc=recovery_code: recovery_secure(
-                    e, "rcode", {"recovery_code": rc}
+                lambda e=email, rc=recovery_code, **kwargs: recovery_secure(
+                    e, "rcode", {"recovery_code": rc}, **kwargs
                 ),
             ))
 
