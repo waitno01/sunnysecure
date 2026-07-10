@@ -3,18 +3,18 @@ import re
 
 from securing.auth.check_locked import check_locked
 
+# Keep patterns specific — bare "blocked" matches template strings like
+# strFedInviteBlockedMsg on every normal login page (false positive).
 _LOCK_HTML_PATTERNS: list[tuple[str, str]] = [
     (r"account\s+has\s+been\s+locked", "Account is locked by Microsoft"),
     (r"your\s+account\s+has\s+been\s+suspended", "Account is suspended"),
     (r"account\s+is\s+locked", "Account is locked by Microsoft"),
     (r"isaccountsuspended|account\s+suspended", "Account is suspended"),
-    (r"verify\s+your\s+identity|identity\s+verification", "Account requires identity verification"),
-    (r"phone\s+verification|verify\s+your\s+phone|isphonelocked", "Account is phone-locked"),
-    (r"unusual\s+activity", "Account flagged for unusual activity"),
-    (r"terms\s+of\s+use|violated\s+our", "Account may be restricted (ToS/abuse)"),
-    (r"recover\s+your\s+account|/account/recover", "Account requires Microsoft recovery"),
-    (r"compromised|accountprotection", "Account may be compromised-locked"),
-    (r"blocked|restricted\s+from\s+signing\s+in", "Account is blocked from signing in"),
+    (r"phone\s+verification\s+required|isphonelocked", "Account is phone-locked"),
+    (r"we\s+noticed\s+some\s+unusual\s+activity", "Account flagged for unusual activity"),
+    (r"violated\s+our\s+terms", "Account may be restricted (ToS/abuse)"),
+    (r"account\s+is\s+blocked\s+from\s+signing\s+in|restricted\s+from\s+signing\s+in", "Account is blocked from signing in"),
+    (r'"isAccountBlocked"\s*:\s*true', "Account is blocked from signing in"),
 ]
 
 

@@ -205,6 +205,21 @@ class DBConnection:
         self.conn.commit()
         return True
 
+    def delete_secured_accounts(self, account_ids: list[str]) -> int:
+        """Delete many accounts in one transaction. Returns number deleted."""
+        ids = [aid for aid in account_ids if self.is_valid_account_id(aid)]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" * len(ids))
+        self.cursor.execute(f"DELETE FROM stats WHERE account_id IN ({placeholders})", ids)
+        self.cursor.execute(f"DELETE FROM shared_links WHERE account_id IN ({placeholders})", ids)
+        self.cursor.execute(
+            f"DELETE FROM secured_accounts WHERE account_id IN ({placeholders})", ids
+        )
+        deleted = self.cursor.rowcount
+        self.conn.commit()
+        return deleted
+
     # Web Methods
     def get_all_secured_accounts(self) -> list:
         rows = self.cursor.execute("""

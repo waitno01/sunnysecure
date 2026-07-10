@@ -2,10 +2,13 @@ import { useState, useEffect, useRef, useLayoutEffect, useCallback } from "react
 import { ReactSkinview3d } from "react-skinview3d";
 import {
   Search, Download, Check, Copy, Link2, Lock, X, Power, ArrowLeft,
-  Loader2, RotateCcw, Mail, ChevronRight, Trash2,
+  Loader2, RotateCcw, Mail, ChevronRight, Trash2, CheckSquare,
 } from "lucide-react";
 import { toast } from "sonner";
 import { cn, simplify } from "@/lib/utils";
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
+} from "@/components/ui/dialog";
 import { useNotifications, authHeaders } from "./context";
 import type { EmailEntry, EmailMessage } from "./types";
 
@@ -940,8 +943,55 @@ export function Accounts() {
   const [showHits, setShowHits] = useState(false);
   const [showExport, setShowExport] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+  const [showBar, setShowBar] = useState(false);
+  const [barStyle, setBarStyle] = useState<React.CSSProperties>({});
+  const [marquee, setMarquee] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
+  const gridRef = useRef<HTMLDivElement>(null);
+  const cardRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const dragRef = useRef<{
+    active: boolean;
+    moved: boolean;
+    startX: number;
+    startY: number;
+    base: Set<string>;
+  } | null>(null);
+  const suppressClickRef = useRef(false);
   const prevCount = useRef(0);
   const { addNotification } = useNotifications();
+
+  const barVisible = selectMode && selectedIds.size > 0;
+
+  useEffect(() => {
+    if (barVisible) {
+      setShowBar(true);
+    } else {
+      const timer = setTimeout(() => setShowBar(false), 300);
+      return () => clearTimeout(timer);
+    }
+  }, [barVisible]);
+
+  const getBarStyle = useCallback(() => {
+    const main = document.querySelector("main");
+    if (!main) return {};
+    const rect = main.getBoundingClientRect();
+    return {
+      left: `${rect.left + rect.width / 2}px`,
+      transform: "translateX(-50%)",
+    };
+  }, []);
+
+  useEffect(() => {
+    if (selectMode && selectedIds.size > 0) {
+      setBarStyle(getBarStyle());
+      const onResize = () => setBarStyle(getBarStyle());
+      window.addEventListener("resize", onResize);
+      return () => window.removeEventListener("resize", onResize);
+    }
+  }, [selectMode, selectedIds.size, getBarStyle]);
 
   useEffect(() => {
     const load = () =>
@@ -976,11 +1026,147 @@ export function Accounts() {
       }
       setAccounts(prev => prev.filter(a => a.account_id !== account.account_id));
       prevCount.current = Math.max(0, prevCount.current - 1);
+      setSelectedIds(prev => {
+        const next = new Set(prev);
+        next.delete(account.account_id);
+        return next;
+      });
       toast.success("Account deleted");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to delete account.");
     } finally {
       setDeletingId(null);
+    }
+  }
+
+  function toggleSelect(id: string) {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function selectAllVisible() {
+    setSelectedIds(new Set(filtered.map(a => a.account_id)));
+    setSelectMode(true);
+  }
+
+  function toggleSelectMode() {
+    const next = !selectMode;
+    setSelectMode(next);
+    if (!next) setSelectedIds(new Set());
+  }
+
+  function idsInMarquee(rect: { left: number; top: number; right: number; bottom: number }) {
+    const hit = new Set<string>();
+    for (const [id, el] of cardRefs.current) {
+      const r = el.getBoundingClientRect();
+      const overlaps =
+        r.left < rect.right &&
+        r.right > rect.left &&
+        r.top < rect.bottom &&
+        r.bottom > rect.top;
+      if (overlaps) hit.add(id);
+    }
+    return hit;
+  }
+
+  function onCardClick(account: Account, e: React.MouseEvent) {
+    if ((e.target as HTMLElement).closest("button")) return;
+    if (suppressClickRef.current) {
+      suppressClickRef.current = false;
+      return;
+    }
+    if (selectMode) {
+      toggleSelect(account.account_id);
+      return;
+    }
+    setSelected(account);
+  }
+
+  function onGridPointerDown(e: React.PointerEvent) {
+    if (e.button !== 0) return;
+    const target = e.target as HTMLElement;
+    if (target.closest("button, a, input, textarea")) return;
+
+    // Keep existing selection as base so a tiny drag doesn't wipe / re-force select
+    const additive = e.ctrlKey || e.metaKey || e.shiftKey || selectMode;
+    dragRef.current = {
+      active: true,
+      moved: false,
+      startX: e.clientX,
+      startY: e.clientY,
+      base: additive ? new Set(selectedIds) : new Set(),
+    };
+  }
+
+  function onGridPointerMove(e: React.PointerEvent) {
+    const drag = dragRef.current;
+    if (!drag?.active) return;
+    const dx = e.clientX - drag.startX;
+    const dy = e.clientY - drag.startY;
+    if (!drag.moved && Math.hypot(dx, dy) < 8) return;
+
+    if (!drag.moved) {
+      drag.moved = true;
+      suppressClickRef.current = true;
+      setSelectMode(true);
+      // Capture only once we know it's a drag (avoids eating normal clicks)
+      gridRef.current?.setPointerCapture?.(e.pointerId);
+    }
+
+    const left = Math.min(drag.startX, e.clientX);
+    const top = Math.min(drag.startY, e.clientY);
+    const right = Math.max(drag.startX, e.clientX);
+    const bottom = Math.max(drag.startY, e.clientY);
+    setMarquee({ x: left, y: top, w: right - left, h: bottom - top });
+
+    const hit = idsInMarquee({ left, top, right, bottom });
+    const next = new Set(drag.base);
+    for (const id of hit) next.add(id);
+    setSelectedIds(next);
+  }
+
+  function onGridPointerUp(e: React.PointerEvent) {
+    const drag = dragRef.current;
+    dragRef.current = null;
+    setMarquee(null);
+    if (drag?.moved) {
+      try {
+        gridRef.current?.releasePointerCapture?.(e.pointerId);
+      } catch {}
+      // Keep suppressClickRef true so the following click is ignored
+      window.setTimeout(() => { suppressClickRef.current = false; }, 0);
+    }
+  }
+
+  async function handleBulkDelete() {
+    const ids = [...selectedIds];
+    if (ids.length === 0) return;
+    setBulkDeleting(true);
+    try {
+      const res = await fetch("/api/accounts/bulk-delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ account_ids: ids }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => null);
+        throw new Error(err?.detail || "Failed to delete accounts.");
+      }
+      const data = await res.json().catch(() => ({ deleted: ids.length }));
+      setAccounts(prev => prev.filter(a => !selectedIds.has(a.account_id)));
+      prevCount.current = Math.max(0, prevCount.current - (data.deleted ?? ids.length));
+      setSelectedIds(new Set());
+      setSelectMode(false);
+      setShowDeleteConfirm(false);
+      toast.success(`Deleted ${data.deleted ?? ids.length} account${(data.deleted ?? ids.length) !== 1 ? "s" : ""}`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to delete accounts.");
+    } finally {
+      setBulkDeleting(false);
     }
   }
 
@@ -1042,6 +1228,18 @@ export function Accounts() {
           </span>
         </button>
         <button
+          onClick={toggleSelectMode}
+          className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2.5 text-sm font-medium transition ${
+            selectMode
+              ? "border-[--accent] bg-[--accent]/15 text-[--accent]"
+              : "border-border bg-card/60 text-muted-foreground hover:text-foreground"
+          }`}
+          title={selectMode ? "Exit selection" : "Select accounts"}
+        >
+          <CheckSquare className="h-4 w-4" />
+          {selectMode ? "Done" : "Select"}
+        </button>
+        <button
           onClick={() => setShowExport(true)}
           className="inline-flex items-center gap-2 rounded-lg border border-border bg-card/60 px-3 py-2.5 text-sm font-medium text-muted-foreground transition hover:text-foreground"
         >
@@ -1067,67 +1265,176 @@ export function Accounts() {
           </div>
         </div>
       ) : (
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(250px, 1fr))", gap: "1rem" }}>
-          {filtered.map((a, i) => (
-            <div key={a.account_id} className="db-acct-card group relative animate-in fade-in slide-in-from-bottom-3 duration-500" onClick={() => setSelected(a)} style={{ animationDelay: `${i * 60}ms` }}>
-              <div className="db-acct-img-section" style={{ position: "relative" }}>
-                <button
-                  type="button"
-                  title="Delete account"
-                  onClick={e => deleteAccount(a, e)}
-                  disabled={deletingId === a.account_id}
-                  style={{
-                    position: "absolute",
-                    right: "0.5rem",
-                    top: "0.5rem",
-                    zIndex: 10,
-                    display: "grid",
-                    placeItems: "center",
-                    width: "1.75rem",
-                    height: "1.75rem",
-                    borderRadius: "0.375rem",
-                    border: "1px solid color-mix(in oklab, #ef4444 35%, transparent)",
-                    background: "color-mix(in oklab, var(--background) 85%, transparent)",
-                    color: "#ef4444",
-                    cursor: deletingId === a.account_id ? "not-allowed" : "pointer",
-                    opacity: deletingId === a.account_id ? 0.5 : 0.85,
+        <>
+          <div
+            ref={gridRef}
+            onPointerDown={onGridPointerDown}
+            onPointerMove={onGridPointerMove}
+            onPointerUp={onGridPointerUp}
+            onPointerCancel={() => { dragRef.current = null; setMarquee(null); }}
+            className="select-none"
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fill, minmax(250px, 1fr))",
+              gap: "1rem",
+              position: "relative",
+              WebkitUserSelect: "none",
+              userSelect: "none",
+            }}
+          >
+            {filtered.map((a, i) => {
+              const isSelected = selectedIds.has(a.account_id);
+              return (
+                <div
+                  key={a.account_id}
+                  data-account-id={a.account_id}
+                  ref={el => {
+                    if (el) cardRefs.current.set(a.account_id, el);
+                    else cardRefs.current.delete(a.account_id);
                   }}
-                >
-                  {deletingId === a.account_id ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  ) : (
-                    <Trash2 className="h-3.5 w-3.5" />
+                  onClick={e => onCardClick(a, e)}
+                  className={cn(
+                    "db-acct-card group relative animate-in fade-in slide-in-from-bottom-3 duration-500",
+                    selectMode && "db-acct-card--select-mode",
+                    isSelected && "db-acct-card--selected",
                   )}
-                </button>
-                <img
-                  src={`https://mc-heads.net/player/${a.mc_name || "MHF_Steve"}`}
-                  alt={a.mc_name}
-                  className="db-acct-skin"
-                  onError={(e) => { (e.target as HTMLImageElement).src = "https://mc-heads.net/player/MHF_Steve"; }}
-                />
-                <span className="db-acct-time">{a.secured_at?.slice(0, 10) ?? "—"}</span>
-              </div>
-              <div className="db-acct-info-section">
-                <div className="db-acct-name">{a.mc_name || a.mc_gamertag || "—"}</div>
-                <div className="db-acct-stats">
-                  <div className="db-acct-stat">
-                    <div className="db-acct-stat-label">Email</div>
-                    <div className="db-acct-stat-val">{a.ms_email || "—"}</div>
+                  style={{ animationDelay: `${i * 60}ms` }}
+                >
+                  <div className="db-acct-img-section" style={{ position: "relative" }}>
+                    {selectMode ? (
+                      <div
+                        className={`absolute left-2 top-2 z-10 grid h-5 w-5 place-items-center rounded border-2 transition ${
+                          isSelected
+                            ? "border-[--accent] bg-[--accent] text-white"
+                            : "border-muted-foreground/50 bg-background/70"
+                        }`}
+                      >
+                        {isSelected && <CheckSquare className="h-3.5 w-3.5" />}
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        title="Delete account"
+                        onClick={e => deleteAccount(a, e)}
+                        disabled={deletingId === a.account_id}
+                        style={{
+                          position: "absolute",
+                          right: "0.5rem",
+                          top: "0.5rem",
+                          zIndex: 10,
+                          display: "grid",
+                          placeItems: "center",
+                          width: "1.75rem",
+                          height: "1.75rem",
+                          borderRadius: "0.375rem",
+                          border: "1px solid color-mix(in oklab, #ef4444 35%, transparent)",
+                          background: "color-mix(in oklab, var(--background) 85%, transparent)",
+                          color: "#ef4444",
+                          cursor: deletingId === a.account_id ? "not-allowed" : "pointer",
+                          opacity: deletingId === a.account_id ? 0.5 : 0.85,
+                        }}
+                      >
+                        {deletingId === a.account_id ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Trash2 className="h-3.5 w-3.5" />
+                        )}
+                      </button>
+                    )}
+                    <img
+                      src={`https://mc-heads.net/player/${a.mc_name || "MHF_Steve"}`}
+                      alt={a.mc_name}
+                      className="db-acct-skin"
+                      draggable={false}
+                      onError={(e) => { (e.target as HTMLImageElement).src = "https://mc-heads.net/player/MHF_Steve"; }}
+                    />
+                    <span className="db-acct-time">{a.secured_at?.slice(0, 10) ?? "—"}</span>
                   </div>
-                  <div className="db-acct-stat">
-                    <div className="db-acct-stat-label">Method</div>
-                    <div className="db-acct-stat-val">{a.mc_method || "—"}</div>
-                  </div>
-                  <div className="db-acct-stat">
-                    <div className="db-acct-stat-label">Capes</div>
-                    <div className="db-acct-stat-val">{a.mc_capes || "—"}</div>
+                  <div className="db-acct-info-section">
+                    <div className="db-acct-name">{a.mc_name || a.mc_gamertag || "—"}</div>
+                    <div className="db-acct-stats">
+                      <div className="db-acct-stat">
+                        <div className="db-acct-stat-label">Email</div>
+                        <div className="db-acct-stat-val">{a.ms_email || "—"}</div>
+                      </div>
+                      <div className="db-acct-stat">
+                        <div className="db-acct-stat-label">Method</div>
+                        <div className="db-acct-stat-val">{a.mc_method || "—"}</div>
+                      </div>
+                      <div className="db-acct-stat">
+                        <div className="db-acct-stat-label">Capes</div>
+                        <div className="db-acct-stat-val">{a.mc_capes || "—"}</div>
+                      </div>
+                    </div>
                   </div>
                 </div>
-              </div>
+              );
+            })}
+          </div>
+
+          {marquee && (
+            <div
+              className="db-acct-marquee"
+              style={{ left: marquee.x, top: marquee.y, width: marquee.w, height: marquee.h }}
+            />
+          )}
+
+          {showBar && (
+            <div
+              className={`fixed bottom-6 z-50 flex w-max items-center gap-4 rounded-2xl border border-[--accent]/30 bg-card/95 px-5 py-3 shadow-xl backdrop-blur-xl ${barVisible ? "animate-in slide-in-from-bottom-4 fade-in" : "animate-out slide-out-to-bottom-4 fade-out"} duration-300`}
+              style={barStyle}
+            >
+              <button
+                onClick={selectAllVisible}
+                className="inline-flex items-center gap-2 text-xs font-semibold text-muted-foreground transition hover:text-foreground"
+              >
+                <CheckSquare className="h-4 w-4" />
+                Select all ({filtered.length})
+              </button>
+              <div className="h-6 w-px bg-border/40" />
+              <span className="text-sm font-semibold text-foreground">
+                {selectedIds.size} selected
+              </span>
+              <div className="h-6 w-px bg-border/40" />
+              <button
+                onClick={() => setShowDeleteConfirm(true)}
+                className="inline-flex cursor-pointer items-center gap-2 rounded-lg bg-red-600/90 px-4 py-2 text-xs font-semibold text-white transition hover:bg-red-600"
+              >
+                <Trash2 className="h-4 w-4" />
+                Delete
+              </button>
             </div>
-          ))}
-        </div>
+          )}
+        </>
       )}
+
+      <Dialog open={showDeleteConfirm} onOpenChange={setShowDeleteConfirm}>
+        <DialogContent className="sm:max-w-md animate-in fade-in zoom-in-95 duration-200">
+          <DialogHeader>
+            <DialogTitle>Delete accounts</DialogTitle>
+            <DialogDescription>
+              Are you sure you want to delete {selectedIds.size} account{selectedIds.size !== 1 ? "s" : ""} from the database? This cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex justify-end gap-3 pt-2">
+            <button
+              onClick={() => setShowDeleteConfirm(false)}
+              disabled={bulkDeleting}
+              className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-border bg-card/60 px-4 py-2 text-sm font-semibold text-muted-foreground transition hover:text-foreground disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleBulkDelete}
+              disabled={bulkDeleting}
+              className="inline-flex cursor-pointer items-center gap-2 rounded-lg bg-red-600/90 px-4 py-2 text-sm font-semibold text-white transition hover:bg-red-600 disabled:opacity-60"
+            >
+              {bulkDeleting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+              {bulkDeleting ? "Deleting…" : "Delete"}
+            </button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

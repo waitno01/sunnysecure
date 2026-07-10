@@ -4,12 +4,29 @@ from typing import Any, Awaitable, Callable, TypeVar
 
 import httpx
 
+try:
+    import httpcore
+except ImportError:  # pragma: no cover
+    httpcore = None  # type: ignore
+
 log = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
 # Transient HTTP statuses that should be retried
 RETRY_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+
+_NETWORK_ERRORS: tuple[type[BaseException], ...] = (
+    httpx.HTTPError,
+    httpx.TimeoutException,
+    OSError,
+)
+if httpcore is not None:
+    _NETWORK_ERRORS = _NETWORK_ERRORS + (
+        httpcore.NetworkError,
+        httpcore.RemoteProtocolError,
+        httpcore.LocalProtocolError,
+    )
 
 
 class TransientMCError(Exception):
@@ -48,7 +65,7 @@ async def with_retries(
                 return None
             await asyncio.sleep(base_delay * attempt)
             continue
-        except (httpx.HTTPError, httpx.TimeoutException, OSError) as exc:
+        except _NETWORK_ERRORS as exc:
             last = None
             log.warning("%s attempt %s/%s network: %s", label, attempt, attempts, exc)
             if attempt >= attempts:

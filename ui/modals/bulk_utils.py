@@ -42,18 +42,41 @@ async def _secure_one(
         return {
             "email": email,
             "status": "failure",
-            "note": account.get("reason", "failed"),
+            # Keep summary notes short — Discord embed fields max out at 1024 chars.
+            "note": str(account.get("reason") or "failed")[:120],
         }
 
     if account == "invalid":
+        fail_embed = build_failure_embed(
+            email,
+            {},
+            "Recovery code was rejected or invalid.",
+            error="invalid",
+        )
+        await _send_failure_dm(user, fail_embed)
         return {"email": email, "status": "failure", "note": "invalid credentials"}
 
     # Legacy callers sometimes returned a plain error string
     if isinstance(account, str) and account not in ("", "invalid"):
+        fail_embed = build_failure_embed(
+            email,
+            {},
+            account[:200],
+            error=account[:200],
+        )
+        await _send_failure_dm(user, fail_embed)
         return {"email": email, "status": "failure", "note": account[:120]}
 
     if not account:
-        return {"email": email, "status": "failure", "note": "failed"}
+        # recover() used to return None with no embed — those accounts vanished from DMs.
+        fail_embed = build_failure_embed(
+            email,
+            {},
+            "Securing returned no result (recovery likely failed before credentials were set).",
+            error="empty result",
+        )
+        await _send_failure_dm(user, fail_embed)
+        return {"email": email, "status": "failure", "note": "empty result"}
 
     try:
         view = accountInfo(account["details"]) if account.get("details") else None

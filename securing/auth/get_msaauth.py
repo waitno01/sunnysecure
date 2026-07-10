@@ -103,20 +103,47 @@ async def get_msaauth(session: httpx.AsyncClient, email: str, flowtoken: str, od
             parsed = get_data(loginData.text)
             if parsed:
                 return parsed
-            lock_reason = await get_account_lock_reason(email, loginData.text)
-            if lock_reason:
-                return {"_error": lock_reason}
-            return {"_error": "MSAAUTH obtained but post-login redirect could not be parsed (unknown login page)."}
+            if isinstance(data, str):
+                parsed = get_data(data)
+                if parsed:
+                    return parsed
+                # Privacy/identity continue may leave a page with ServerData tokens
+                sft_m = re.search(r'"sFT"\s*:\s*"([^"]+)"', data)
+                post_m = re.search(r'"urlPost"\s*:\s*"([^"]+)"', data)
+                if sft_m and post_m:
+                    return {
+                        "urlPost": post_m.group(1),
+                        "ppft": quote(sft_m.group(1), safe="-*"),
+                    }
+
+            # MSAAUTH is enough to continue — polish can establish AMC via cookie SSO
+            logging.warning(
+                "MSAAUTH present for %s but no urlPost after redirects — cookies-only polish",
+                email,
+            )
+            return {"_cookies_only": True}
 
         sft_match = re.search(r'"sFT"\s*:\s*"([^"]+)"', loginData.text)
         if not sft_match:
             data = await handle_redirects(session, loginData.text)
-            if isinstance(data, dict):
+            if isinstance(data, dict) and data.get("urlPost"):
                 return data
-            lock_reason = await get_account_lock_reason(email, loginData.text)
+            if isinstance(data, dict) and data.get("_cookies_only"):
+                return data
+            # Prefer real OTP/login errors over HTML lock false-positives
+            err = re.search(r'"sErrTxt"\s*:\s*"((?:\\.|[^"])*)"', loginData.text)
+            if err:
+                txt = re.sub(r"<[^>]+>", "", err.group(1)).replace('\\"', '"')
+                if txt.strip():
+                    return {"_error": txt.strip()[:200]}
+            lock_reason = await get_account_lock_reason(email, None)
             if lock_reason:
                 return {"_error": lock_reason}
-            return {"_error": "MSAAUTH obtained but login page did not include sFT token."}
+            logging.warning(
+                "MSAAUTH present for %s but no sFT — cookies-only polish",
+                email,
+            )
+            return {"_cookies_only": True}
 
         ppft = quote(sft_match.group(1), safe='-*')
 
@@ -124,6 +151,13 @@ async def get_msaauth(session: httpx.AsyncClient, email: str, flowtoken: str, od
             "urlPost" : urlPost.group(1),
             "ppft": ppft
         }
+
+    # Prefer explicit login error text over HTML lock heuristics
+    err = re.search(r'"sErrTxt"\s*:\s*"((?:\\.|[^"])*)"', loginData.text)
+    if err:
+        txt = re.sub(r"<[^>]+>", "", err.group(1)).replace('\\"', '"').strip()
+        if txt:
+            return {"_error": txt[:200]}
 
     lock_reason = await get_account_lock_reason(email, loginData.text)
     if lock_reason:

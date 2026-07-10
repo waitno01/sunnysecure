@@ -135,6 +135,26 @@ input.custom-range::-moz-range-thumb {
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.22);
 }
 
+.db-acct-card.db-acct-card--selected {
+  border-color: color-mix(in oklab, var(--accent) 70%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--accent) 40%, transparent),
+    0 12px 32px rgba(0, 0, 0, 0.18);
+  background: color-mix(in oklab, var(--accent) 8%, var(--card));
+}
+
+.db-acct-card.db-acct-card--select-mode:hover {
+  transform: none;
+}
+
+.db-acct-marquee {
+  position: fixed;
+  z-index: 40;
+  pointer-events: none;
+  border: 1px solid color-mix(in oklab, var(--accent) 70%, transparent);
+  background: color-mix(in oklab, var(--accent) 18%, transparent);
+  border-radius: 4px;
+}
+
 .db-acct-img-section {
   height: 190px;
   display: flex;

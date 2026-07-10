@@ -10,13 +10,23 @@ import json
 import re
 
 
+class RecoverError(Exception):
+    """User-facing failure during recovery-code flow."""
+
+    def __init__(self, reason: str, *, ms_code: object | None = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.ms_code = ms_code
+
+
 async def verify_password_works(session: httpx.AsyncClient, email: str, password: str) -> str:
     """Check whether Microsoft accepted the new password.
 
     Returns: "ok" | "bad" | "unknown"
     """
     try:
-        await asyncio.sleep(2.0)
+        # RecoverUser password propagation is often delayed under load.
+        await asyncio.sleep(4.0)
         dedupe_cookies(session)
 
         live = await livedata(session)
@@ -82,7 +92,6 @@ async def verify_password_works(session: httpx.AsyncClient, email: str, password
             logging.info("Password verify OK for %s (status=%s)", email, check.status_code)
             return "ok"
 
-        # Login page without explicit wrong-password — inconclusive
         if "sErrTxt" in text and "incorrect" in lower:
             return "bad"
 
@@ -113,10 +122,69 @@ MS_HEADERS = {
 RECOVER_SCID = 100103
 RECOVER_UIFLVR = 1001
 
-# Required for RecoverUser to apply the password when using the VerifyRecoveryCode
-# token (v:...). Confirmed live: without this, RecoverUser still returns
-# recoveryCode + contactEmail but login fails with 80041012.
 RECOVER_PUBLIC_KEY = "25CE4D96CB3A09A69CD847C69FC6D40AF4A4DE12"
+
+_MS_RECOVERY_CODE_ERRORS = {
+    1300: "Invalid or already-used recovery code (Microsoft error 1300).",
+    1301: "Recovery code rejected (Microsoft error 1301).",
+    1200: "Recovery session expired — retry with the same recovery code.",
+    6001: "Recovery credentials expired — retry the account.",
+}
+
+
+def _extract_balanced_object(html: str, start_idx: int) -> str | None:
+    if start_idx < 0 or start_idx >= len(html) or html[start_idx] != "{":
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    quote = ""
+    for i in range(start_idx, len(html)):
+        ch = html[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == quote:
+                in_str = False
+            continue
+        if ch in ("'", '"'):
+            in_str = True
+            quote = ch
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return html[start_idx : i + 1]
+    return None
+
+
+def _extract_server_data(html: str) -> dict | None:
+    """Parse ServerData via brace-matching (old regex stopped at first ';')."""
+    for pat in (
+        r"var\s+ServerData\s*=\s*\{",
+        r"window\.ServerData\s*=\s*\{",
+        r"ServerData\s*=\s*\{",
+    ):
+        m = re.search(pat, html)
+        if not m:
+            continue
+        brace_at = html.find("{", m.start())
+        raw = _extract_balanced_object(html, brace_at)
+        if not raw:
+            continue
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            try:
+                return json.loads(raw[: raw.rfind("}") + 1])
+            except json.JSONDecodeError:
+                logging.warning("recover: ServerData JSON decode failed (len=%s)", len(raw))
+                continue
+    return None
 
 
 def _parse_json(response: httpx.Response, step: str) -> dict | None:
@@ -137,7 +205,19 @@ def _parse_json(response: httpx.Response, step: str) -> dict | None:
 
     if "error" in data and "apiCanary" not in data and "token" not in data and "recoveryCode" not in data:
         err = data.get("error") or {}
-        logging.error("%s: Microsoft error %s", step, err.get("code", data))
+        code = err.get("code") if isinstance(err, dict) else err
+        logging.error("%s: Microsoft error %s body=%s", step, code, data)
+        if step == "VerifyRecoveryCode":
+            try:
+                code_i = int(code)
+            except (TypeError, ValueError):
+                code_i = None
+            if code_i in _MS_RECOVERY_CODE_ERRORS:
+                raise RecoverError(_MS_RECOVERY_CODE_ERRORS[code_i], ms_code=code_i)
+            raise RecoverError(
+                f"Recovery code rejected by Microsoft (error {code}).",
+                ms_code=code,
+            )
         return None
 
     return data
@@ -152,30 +232,40 @@ async def recover(
 ):
     """Automates recovery via recovery code.
 
-    Live reverse-engineer findings (2026-07-09 against real MSA):
-
-    1. VerifyRecoveryCode returns token prefix ``v:``
-    2. VerifyCode (after SendOtt) returns a NEW token prefix ``a:``
-    3. RecoverUser with the ``a:`` token → error 6001 (ExpiredCredentials)
-    4. RecoverUser with the ``v:`` token and NO publicKey → returns recoveryCode
-       + contactEmail, but password is NOT applied (login 80041012)
-    5. RecoverUser with the ``v:`` token AND publicKey → password applies
-
-    So we keep the SendOtt/VerifyCode steps (needed to register the new
-    security email), but RecoverUser must use the original ``v:`` token plus
-    publicKey — not the post-VerifyCode ``a:`` token.
+    Raises RecoverError for invalid recovery codes / known MS rejects.
+    Returns the new recovery code string on success, or None on soft failure.
     """
+    recovery_code = (recovery_code or "").strip().upper().replace(" ", "")
+
     data = await session.get(
-        url=f"https://account.live.com/ResetPassword.aspx?wreply=https://login.live.com/oauth20_authorize.srf&mn={email}"
+        url=(
+            "https://account.live.com/ResetPassword.aspx"
+            f"?wreply=https://login.live.com/oauth20_authorize.srf&mn={email}"
+        ),
+        follow_redirects=True,
     )
-    logging.info("sRecovery: %s", data.text[:800])
+    logging.info(
+        "sRecovery: status=%s url=%s len=%s body=%s",
+        data.status_code,
+        data.url,
+        len(data.text or ""),
+        (data.text or "")[:1200],
+    )
 
-    server_data_match = re.search(r"var\s+ServerData=(.*?)(?=;|$)", data.text)
-    if not server_data_match:
-        logging.error("recover: could not parse ServerData for %s", email)
-        return "invalid"
+    server_data = _extract_server_data(data.text or "")
+    if not server_data or "sRecoveryToken" not in server_data or "apiCanary" not in server_data:
+        title_m = re.search(r"<title[^>]*>(.*?)</title>", data.text or "", re.I | re.S)
+        title = re.sub(r"\s+", " ", title_m.group(1)).strip()[:80] if title_m else "?"
+        logging.error(
+            "recover: could not parse ServerData for %s (keys=%s title=%s)",
+            email,
+            list(server_data.keys())[:20] if server_data else None,
+            title,
+        )
+        raise RecoverError(
+            "Recovery page could not be parsed (ServerData/sRecoveryToken missing). Retry."
+        )
 
-    server_data = json.loads(server_data_match.group(1))
     decoded_token = codecs.decode(unquote(server_data["sRecoveryToken"]), "unicode_escape")
     uaid = server_data.get("sUnauthSessionID", "")
 
@@ -202,7 +292,6 @@ async def recover(
         return None
 
     canary = rec_json["apiCanary"]
-    # Keep this v: token for RecoverUser — do NOT replace with VerifyCode's a: token.
     recover_token = rec_json["token"]
 
     send_code = await session.post(
@@ -232,7 +321,7 @@ async def recover(
     code = await get_email_code(new_email)
     if not code:
         logging.error("recover: timed out waiting for OTP at %s", new_email)
-        return None
+        raise RecoverError("Timed out waiting for OTP at the new security email during recovery.")
 
     verify_code_response = await session.post(
         url="https://account.live.com/API/Proofs/VerifyCode",
@@ -294,13 +383,14 @@ async def recover(
         return None
 
     if finish_json.get("error") and not finish_json.get("recoveryCode"):
+        err = finish_json.get("error") or {}
+        code = err.get("code") if isinstance(err, dict) else err
         logging.error("RecoverUser error: %s", finish_json.get("error"))
-        return None
+        raise RecoverError(f"RecoverUser failed (Microsoft error {code}).")
 
     if "recoveryCode" in finish_json:
         new_rc = finish_json["recoveryCode"]
         print(f"[+] - RecoverUser OK (password length={len(new_password)}, publicKey=yes)")
-        # Always print the new code — truncated body logs have lost this before.
         print(f"[+] - New recovery code: {new_rc}")
         logging.info("RecoverUser new recoveryCode=%s contactEmail=%s", new_rc, new_email)
         return new_rc

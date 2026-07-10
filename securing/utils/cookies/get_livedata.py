@@ -42,32 +42,89 @@ def _extract_url_post(html: str) -> str | None:
     return None
 
 
+def _clear_msa_login_cookies(session: httpx.AsyncClient) -> None:
+    """Drop MSA auth cookies that make login.live.com return empty 302s."""
+    names = (
+        "__Host-MSAAUTH",
+        "__Host-MSAAUTHP",
+        "MSPAuth",
+        "MSPProf",
+        "MSPVis",
+        "MSPPre",
+        "MSPCID",
+        "MSPBack",
+        "NAP",
+        "ANON",
+        "WLSSC",
+        "AMCSecAuth",
+        "AMCSecAuthJWT",
+    )
+    for name in names:
+        try:
+            session.cookies.delete(name)
+        except Exception:
+            pass
+        # httpx may scope cookies by domain — clear common hosts
+        for domain in (".live.com", "login.live.com", ".login.live.com",
+                       ".microsoft.com", "account.microsoft.com", ".account.microsoft.com"):
+            try:
+                session.cookies.delete(name, domain=domain)
+            except Exception:
+                pass
+
+
 async def livedata(session: httpx.AsyncClient) -> dict:
     """Fetch login.live.com urlPost + PPFT for subsequent login posts.
 
     Microsoft changes post.srf query params often (e.g. dropped ``pid=0``).
     Never call ``.group()`` on a failed match — that produced the useless
     ``AttributeError: 'NoneType' object has no attribute 'group'`` failures.
+
+    If the session is already authenticated, login.live.com returns an empty
+    302 with no form — clear MSA cookies and retry once.
     """
-    response = await session.post("https://login.live.com")
-    html = response.text or ""
+    last_status = None
+    last_html = ""
 
-    url_post = _extract_url_post(html)
-    ppft = _extract_ppft(html)
-
-    if not url_post or not ppft:
-        page_id = re.search(r'PageID" content="([^"]+)"', html)
-        logging.error(
-            "livedata parse failed status=%s page=%s urlPost=%s ppft=%s snippet=%s",
-            response.status_code,
-            page_id.group(1) if page_id else "?",
-            bool(url_post),
-            bool(ppft),
-            html[:400].replace("\n", " "),
+    for attempt in range(2):
+        response = await session.post(
+            "https://login.live.com",
+            follow_redirects=True,
         )
-        raise RuntimeError(
-            "Failed to parse Microsoft login page (urlPost/PPFT missing). "
-            f"PageID={page_id.group(1) if page_id else 'unknown'} — try again."
-        )
+        last_status = response.status_code
+        last_html = response.text or ""
 
-    return {"urlPost": url_post, "ppft": ppft}
+        url_post = _extract_url_post(last_html)
+        ppft = _extract_ppft(last_html)
+        if url_post and ppft:
+            return {"urlPost": url_post, "ppft": ppft}
+
+        # Already-signed-in sessions often get a blank/redirect page.
+        if attempt == 0 and (
+            last_status in (301, 302, 303)
+            or not last_html.strip()
+            or not url_post
+            or not ppft
+        ):
+            logging.warning(
+                "livedata: no login form (status=%s len=%s) — clearing MSA cookies and retrying",
+                last_status,
+                len(last_html),
+            )
+            _clear_msa_login_cookies(session)
+            continue
+        break
+
+    page_id = re.search(r'PageID" content="([^"]+)"', last_html)
+    logging.error(
+        "livedata parse failed status=%s page=%s urlPost=%s ppft=%s snippet=%s",
+        last_status,
+        page_id.group(1) if page_id else "?",
+        bool(_extract_url_post(last_html)),
+        bool(_extract_ppft(last_html)),
+        last_html[:400].replace("\n", " "),
+    )
+    raise RuntimeError(
+        "Failed to parse Microsoft login page (urlPost/PPFT missing). "
+        f"PageID={page_id.group(1) if page_id else 'unknown'} — try again."
+    )

@@ -2,6 +2,7 @@ from minecraft.get_hypixel import get_hypixel_stats
 from minecraft.get_donut import get_donut_stats
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 from database.database import DBConnection
 from web.config import require_auth
 from datetime import datetime
@@ -9,6 +10,11 @@ import json
 import time
 
 router = APIRouter()
+
+
+class BulkDeleteRequest(BaseModel):
+    account_ids: list[str] = Field(default_factory=list)
+
 
 @router.get("/api/accounts")
 def accounts(user: str = Depends(require_auth)):
@@ -23,6 +29,15 @@ def account_detail(account_id: str, user: str = Depends(require_auth)):
             raise HTTPException(404, detail="Account not found.")
         
         return row
+
+@router.post("/api/accounts/bulk-delete")
+def bulk_delete_accounts(body: BulkDeleteRequest, user: str = Depends(require_auth)):
+    ids = [aid.strip() for aid in body.account_ids if aid and aid.strip()]
+    if not ids:
+        raise HTTPException(400, detail="No account IDs provided.")
+    with DBConnection() as db:
+        deleted = db.delete_secured_accounts(ids)
+        return {"ok": True, "deleted": deleted}
 
 @router.delete("/api/accounts/{account_id}")
 def delete_account(account_id: str, user: str = Depends(require_auth)):

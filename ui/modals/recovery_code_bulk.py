@@ -68,12 +68,39 @@ class BulkRecoveryCodeModal(ui.Modal):
             summary_embed.add_field(name="Failed", value=str(failures), inline=True)
 
             if failed_emails:
-                failed_list = "\n".join(failed_emails[:15])
-                if len(failed_emails) > 15:
-                    failed_list += f"\n...and {len(failed_emails) - 15} more"
-                summary_embed.add_field(name="Failed Accounts", value=failed_list, inline=False)
+                # Discord embed field value max is 1024 chars. Long RuntimeError
+                # reasons used to blow this up and hide the whole summary.
+                lines: list[str] = []
+                budget = 1000
+                omitted = 0
+                for entry in failed_emails:
+                    line = entry if len(entry) <= 180 else entry[:177] + "..."
+                    if sum(len(x) + 1 for x in lines) + len(line) + 1 > budget:
+                        omitted += 1
+                        continue
+                    lines.append(line)
+                if omitted:
+                    lines.append(f"...and {omitted} more")
+                summary_embed.add_field(
+                    name="Failed Accounts",
+                    value="\n".join(lines) or "(see DMs)",
+                    inline=False,
+                )
 
             try:
                 await processing_msg.edit(embed=summary_embed)
             except discord.HTTPException:
-                await interaction.followup.send(embed=summary_embed, ephemeral=True)
+                try:
+                    await interaction.followup.send(embed=summary_embed, ephemeral=True)
+                except discord.HTTPException:
+                    # Last resort — counts only, no failed list
+                    tiny = discord.Embed(
+                        title="Bulk Secure Complete",
+                        description=(
+                            f"Processed **{hits + failures}** · "
+                            f"Hits **{hits}** · Failed **{failures}**\n"
+                            f"(Failed list omitted — check DMs for details.)"
+                        ),
+                        color=0x2765F5,
+                    )
+                    await interaction.followup.send(embed=tiny, ephemeral=True)

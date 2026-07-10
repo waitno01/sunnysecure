@@ -46,6 +46,29 @@ async def polish_host(session: httpx.AsyncClient, post_data: dict) -> str:
     # Persist Microsoft session (WLSSC / AMCSecAuthJWT) for account.microsoft.com APIs.
     # Never block forever: MSAL JS bridge SSO GETs hang with timeout=None.
 
+    if post_data.get("_cookies_only"):
+        print("[~] - Polish: cookies-only path (MSAAUTH already present)")
+        logging.info("polish_host: cookies-only — hitting account portals for AMC/WLSSC")
+        for portal in (
+            "https://account.live.com/",
+            "https://account.microsoft.com/",
+        ):
+            try:
+                resp = await session.get(
+                    portal,
+                    follow_redirects=True,
+                    timeout=_POLISH_TIMEOUT,
+                )
+                logging.info(
+                    "polish_host cookies-only %s → status=%s url=%s",
+                    portal,
+                    resp.status_code,
+                    resp.url,
+                )
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                logging.warning("polish_host cookies-only %s failed: %s", portal, exc)
+        return ""
+
     polish = await session.post(
         url=post_data["urlPost"],
         headers={

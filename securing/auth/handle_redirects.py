@@ -172,14 +172,18 @@ async def handle_fido(session: httpx.AsyncClient, redirect: str) -> dict:
 
 # Accept Notice Form
 async def handle_notice(session: httpx.AsyncClient, action_url: str, redirect: str) -> str:
-    notice_m = re.search(
-        r'id="correlation_id"\s+value="([^"]+)".*?id="code"\s+value="([^"]+)"',
-        redirect,
-        re.DOTALL,
-    )
-    if not notice_m:
-        raise RuntimeError("Privacy notice form missing correlation_id/code.")
-    cid, actioncode = notice_m.groups()
+    fields = _extract_form_fields(redirect)
+    cid = fields.get("correlation_id")
+    actioncode = fields.get("code")
+    if not cid or not actioncode:
+        notice_m = re.search(
+            r'(?:id|name)="correlation_id"\s+value="([^"]+)".*?(?:id|name)="code"\s+value="([^"]+)"',
+            redirect,
+            re.DOTALL,
+        )
+        if not notice_m:
+            raise RuntimeError("Privacy notice form missing correlation_id/code.")
+        cid, actioncode = notice_m.groups()
 
     acceptNotice = await session.post(
         url=action_url,
@@ -187,12 +191,28 @@ async def handle_notice(session: httpx.AsyncClient, action_url: str, redirect: s
             "correlation_id": cid,
             "code": actioncode,
         },
+        follow_redirects=True,
     )
-    url_m = re.search(r"var redirectUrl = '([^']+)';", acceptNotice.text)
+    url_m = (
+        re.search(r"var\s+redirectUrl\s*=\s*'([^']+)'", acceptNotice.text)
+        or re.search(r'var\s+redirectUrl\s*=\s*"([^"]+)"', acceptNotice.text)
+        or re.search(r'"redirectUrl"\s*:\s*"([^"]+)"', acceptNotice.text)
+        or re.search(r'action="(https://login\.live\.com/[^"]+)"', acceptNotice.text)
+    )
     if not url_m:
+        # Notice may already have completed via redirects
+        parsed = get_data(acceptNotice.text)
+        if parsed:
+            return acceptNotice.text
+        logging.warning(
+            "Privacy notice response missing redirectUrl (status=%s len=%s snippet=%r)",
+            acceptNotice.status_code,
+            len(acceptNotice.text),
+            acceptNotice.text[:400],
+        )
         raise RuntimeError("Privacy notice response missing redirectUrl.")
-    postURL = url_m.group(1).replace(r"\\u0026", "&")
-    response = await session.post(postURL)
+    postURL = url_m.group(1).replace(r"\\u0026", "&").replace("&amp;", "&")
+    response = await session.post(postURL, follow_redirects=True)
     return response.text
 
 async def handle_redirects(session: httpx.AsyncClient, response: str) -> dict | str | None:
@@ -227,6 +247,27 @@ async def handle_redirects(session: httpx.AsyncClient, response: str) -> dict | 
             print(f"[~] - Handling Accept Notice Form")
             logging.info(f"Accept Notice Response: {response[:500]}...")
             result = await handle_notice(session, action_url, response)
+
+        # Identity confirm interrupt (Help us protect / confirm it's you)
+        elif "identity/confirm" in action_url:
+            print("[~] - Handling identity/confirm interrupt")
+            if "pprid" in response:
+                result = await submit_form(session, action_url, response)
+            else:
+                fields = _extract_form_fields(response)
+                result = (
+                    await session.post(action_url, data=fields, follow_redirects=True)
+                ).text
+            # Often followed by a skipable proofs / overprotective page
+            result = await resolve_proofs_interstitials(session, result, action_url)
+            skip_match = (
+                re.search(r'"skip":\s*\{"url"\s*:\s*"([^"]+)"', result)
+                or re.search(r'"skipUrl"\s*:\s*"([^"]+)"', result)
+            )
+            if skip_match:
+                skip_url = skip_match.group(1).replace("\\u0026", "&")
+                skip_response = await session.get(skip_url, follow_redirects=True)
+                result = skip_response.text
 
         # Submit forms with pprid/ipt
         elif "pprid" in response:

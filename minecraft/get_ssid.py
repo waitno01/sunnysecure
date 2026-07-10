@@ -33,8 +33,13 @@ async def _get_ssid_once(xbl: str) -> str | None:
 
         # 401/403 with error payload usually means no MC ownership — don't retry forever
         err = jresponse.get("error") or jresponse.get("errorMessage") or ""
-        if response.status_code in (401, 403) and "NOT_FOUND" not in str(err).upper():
-            # Some auth races return 401 briefly after XBL mint
+        err_u = str(err).upper()
+        if response.status_code in (401, 403):
+            # Genuine "no entitlement" signals
+            if any(x in err_u for x in ("NOT_FOUND", "NO_ENTITLEMENT", "FORBIDDEN", "UNAUTHORIZED")):
+                log.info("get_ssid: no MC entitlement (%s)", err or response.status_code)
+                return None
+            # Auth races return 401 briefly after XBL mint
             raise TransientMCError(f"login_with_xbox auth race: {err or response.status_code}")
 
         return None
@@ -44,7 +49,7 @@ async def get_ssid(xbl: str) -> str | None:
     return await with_retries(
         "get_ssid",
         lambda: _get_ssid_once(xbl),
-        attempts=3,
-        base_delay=2.0,
+        attempts=5,
+        base_delay=5.0,
         retry_on_none=False,
     )

