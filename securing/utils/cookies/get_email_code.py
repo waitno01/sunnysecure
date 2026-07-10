@@ -48,28 +48,52 @@ def _is_skippable_notification(subject: str | None, body: str) -> bool:
     return False
 
 
-async def get_email_code(mail: str, timeout: float = 120) -> str | None:
+async def get_email_code(
+    mail: str,
+    timeout: float = 120,
+    *,
+    since: float | None = None,
+) -> str | None:
     """Wait for a Microsoft OTP at ``mail``.
 
     Ignores security-notification mail and footer LinkId false-positives
     (e.g. ``521839`` from the Privacy Statement URL) that previously caused
     ``That code didn't work`` failures.
+
+    If ``since`` is set (unix timestamp), only mail with ``received_at`` at/after
+    that time is considered — avoids consuming a pre-challenge login OTP and
+    then waiting forever for a proofs MFA code that never arrives.
     """
     deadline = time.monotonic() + timeout
     mail_l = (mail or "").lower().strip()
+    since_cutoff = None
+    if since is not None:
+        # SQLite CURRENT_TIMESTAMP is UTC "YYYY-MM-DD HH:MM:SS"
+        since_cutoff = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(since - 2))
 
     while time.monotonic() < deadline:
         with DBConnection() as db:
-            # Prefer newest unused mail so a late real OTP wins over stale junk
-            rows = db.cursor.execute(
-                """
-                SELECT id, body, subject FROM `received_emails`
-                WHERE lower(to_address) = ? AND consumed = 0
-                ORDER BY id DESC
-                LIMIT 8
-                """,
-                (mail_l,),
-            ).fetchall()
+            if since_cutoff:
+                rows = db.cursor.execute(
+                    """
+                    SELECT id, body, subject FROM `received_emails`
+                    WHERE lower(to_address) = ? AND consumed = 0
+                      AND received_at >= ?
+                    ORDER BY id DESC
+                    LIMIT 8
+                    """,
+                    (mail_l, since_cutoff),
+                ).fetchall()
+            else:
+                rows = db.cursor.execute(
+                    """
+                    SELECT id, body, subject FROM `received_emails`
+                    WHERE lower(to_address) = ? AND consumed = 0
+                    ORDER BY id DESC
+                    LIMIT 8
+                    """,
+                    (mail_l,),
+                ).fetchall()
 
         for email_id, body, subject in rows:
             if _is_skippable_notification(subject, body or ""):

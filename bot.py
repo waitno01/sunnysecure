@@ -88,7 +88,7 @@ class DiscordBot(commands.Bot):
         root = logging.getLogger()
         root.setLevel(logging.INFO)
 
-        file_handler = logging.FileHandler("logs/securing.log", mode="w")
+        file_handler = logging.FileHandler("logs/securing.log", mode="a")
         file_handler.setLevel(logging.INFO)
         root.addHandler(file_handler)
 

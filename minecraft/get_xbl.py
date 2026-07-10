@@ -391,7 +391,7 @@ async def get_xbl(session: httpx.AsyncClient) -> dict | None:
     return await with_retries(
         "get_xbl",
         lambda: _get_xbl_once(session),
-        attempts=5,
-        base_delay=3.0,
+        attempts=7,
+        base_delay=4.0,
         retry_on_none=False,
     )

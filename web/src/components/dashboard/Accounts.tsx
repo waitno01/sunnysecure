@@ -1,8 +1,8 @@
-import { useState, useEffect, useRef, useLayoutEffect, useCallback } from "react";
+import { useState, useEffect, useRef, useLayoutEffect, useCallback, useMemo } from "react";
 import { ReactSkinview3d } from "react-skinview3d";
 import {
   Search, Download, Check, Copy, Link2, Lock, X, Power, ArrowLeft,
-  Loader2, RotateCcw, Mail, ChevronRight, Trash2, CheckSquare,
+  Loader2, RotateCcw, Mail, ChevronRight, Trash2, CheckSquare, Filter,
 } from "lucide-react";
 import { toast } from "sonner";
 import { cn, simplify } from "@/lib/utils";
@@ -39,6 +39,77 @@ export type Account = {
   mc_ssid?: string;
   mc_uchange?: string;
 };
+
+/** gamepass | owned (purchased / java) | no_mc (none or check failed) */
+type McCategory = "gamepass" | "owned" | "no_mc";
+type McFilter = "all" | McCategory;
+type SortMode = "newest" | "oldest" | "mc_type" | "mc_type_rev";
+
+const LS_EXCLUDE_DUPES = "autosecure.accounts.excludeDuplicates";
+const LS_MC_FILTER = "autosecure.accounts.mcFilter";
+const LS_SORT = "autosecure.accounts.sortMode";
+
+function readLs<T extends string>(key: string, fallback: T, allowed: readonly T[]): T {
+  try {
+    const v = localStorage.getItem(key) as T | null;
+    if (v && (allowed as readonly string[]).includes(v)) return v;
+  } catch { /* ignore */ }
+  return fallback;
+}
+
+function accountMcCategory(a: Account): McCategory {
+  const name = (a.mc_name || "").trim();
+  const method = (a.mc_method || "").trim().toLowerCase();
+  const nameL = name.toLowerCase();
+
+  if (
+    !name ||
+    nameL === "no minecraft" ||
+    nameL.includes("mc check failed") ||
+    nameL.includes("no minecraft") ||
+    method.includes("mc check failed") ||
+    method === "not purchased" ||
+    method === "unknown"
+  ) {
+    return "no_mc";
+  }
+  if (method.includes("gamepass")) return "gamepass";
+  // Purchased / has a real profile name (incl. No Java / Owned labels)
+  if (
+    method.includes("purchased") ||
+    method.includes("mc_purchase") ||
+    nameL.includes("no java") ||
+    nameL.startsWith("owned")
+  ) {
+    return "owned";
+  }
+  // Has a username but method unknown → treat as owned (MC present)
+  if (name && !nameL.includes("failed")) return "owned";
+  return "no_mc";
+}
+
+const MC_TYPE_ORDER: Record<McCategory, number> = {
+  gamepass: 0,
+  owned: 1,
+  no_mc: 2,
+};
+
+function dedupeLatestByEmail(list: Account[]): Account[] {
+  // API already returns secured_at DESC — keep first seen per email
+  const seen = new Set<string>();
+  const out: Account[] = [];
+  for (const a of list) {
+    const key = (a.ms_email || "").trim().toLowerCase();
+    if (!key) {
+      out.push(a);
+      continue;
+    }
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(a);
+  }
+  return out;
+}
 
 const PREVIEW = {
   username: "Notch",
@@ -950,6 +1021,15 @@ export function Accounts() {
   const [showBar, setShowBar] = useState(false);
   const [barStyle, setBarStyle] = useState<React.CSSProperties>({});
   const [marquee, setMarquee] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
+  const [excludeDuplicates, setExcludeDuplicates] = useState(() =>
+    readLs(LS_EXCLUDE_DUPES, "0", ["0", "1"] as const) === "1"
+  );
+  const [mcFilter, setMcFilter] = useState<McFilter>(() =>
+    readLs(LS_MC_FILTER, "all", ["all", "gamepass", "owned", "no_mc"] as const)
+  );
+  const [sortMode, setSortMode] = useState<SortMode>(() =>
+    readLs(LS_SORT, "newest", ["newest", "oldest", "mc_type", "mc_type_rev"] as const)
+  );
   const gridRef = useRef<HTMLDivElement>(null);
   const cardRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const dragRef = useRef<{
@@ -1170,10 +1250,58 @@ export function Accounts() {
     }
   }
 
-  const hits = accounts.filter(a => !a.mc_name);
-  const filtered = (search.trim() ? accounts : (showHits ? hits : accounts)).filter(a =>
-    a.ms_email?.toLowerCase().includes(search.toLowerCase()) ||
-    a.mc_name?.toLowerCase().includes(search.toLowerCase())
+  useEffect(() => {
+    try { localStorage.setItem(LS_EXCLUDE_DUPES, excludeDuplicates ? "1" : "0"); } catch { /* ignore */ }
+  }, [excludeDuplicates]);
+  useEffect(() => {
+    try { localStorage.setItem(LS_MC_FILTER, mcFilter); } catch { /* ignore */ }
+  }, [mcFilter]);
+  useEffect(() => {
+    try { localStorage.setItem(LS_SORT, sortMode); } catch { /* ignore */ }
+  }, [sortMode]);
+
+  const hits = useMemo(() => accounts.filter(a => !a.mc_name), [accounts]);
+
+  const filtered = useMemo(() => {
+    let list = showHits && !search.trim() ? hits : accounts;
+
+    if (excludeDuplicates) {
+      list = dedupeLatestByEmail(list);
+    }
+
+    const q = search.trim().toLowerCase();
+    if (q) {
+      list = list.filter(a =>
+        a.ms_email?.toLowerCase().includes(q) ||
+        a.mc_name?.toLowerCase().includes(q) ||
+        a.mc_gamertag?.toLowerCase().includes(q)
+      );
+    }
+
+    if (mcFilter !== "all") {
+      list = list.filter(a => accountMcCategory(a) === mcFilter);
+    }
+
+    const sorted = [...list];
+    sorted.sort((a, b) => {
+      if (sortMode === "mc_type" || sortMode === "mc_type_rev") {
+        const ca = MC_TYPE_ORDER[accountMcCategory(a)];
+        const cb = MC_TYPE_ORDER[accountMcCategory(b)];
+        const dir = sortMode === "mc_type" ? ca - cb : cb - ca;
+        if (dir !== 0) return dir;
+      } else if (sortMode === "oldest") {
+        return (a.secured_at || "").localeCompare(b.secured_at || "");
+      } else {
+        return (b.secured_at || "").localeCompare(a.secured_at || "");
+      }
+      return (b.secured_at || "").localeCompare(a.secured_at || "");
+    });
+    return sorted;
+  }, [accounts, hits, showHits, search, excludeDuplicates, mcFilter, sortMode]);
+
+  const hiddenDupes = useMemo(
+    () => (excludeDuplicates ? Math.max(0, accounts.length - dedupeLatestByEmail(accounts).length) : 0),
+    [accounts, excludeDuplicates],
   );
 
   if (selected) {
@@ -1195,7 +1323,10 @@ export function Accounts() {
         <div>
           <h1 className="font-display text-2xl font-bold tracking-tight sm:text-3xl">Secured Accounts</h1>
           <p className="mt-1 text-sm font-semibold text-muted-foreground">
-            {showHits ? `${hits.length} hit${hits.length !== 1 ? "s" : ""}` : `${accounts.length - hits.length} account${accounts.length - hits.length !== 1 ? "s" : ""}`} in database
+            {filtered.length} shown
+            {excludeDuplicates && hiddenDupes > 0 ? ` · ${hiddenDupes} older duplicate${hiddenDupes !== 1 ? "s" : ""} hidden` : ""}
+            {" · "}
+            {showHits ? `${hits.length} hit${hits.length !== 1 ? "s" : ""}` : `${accounts.length} total`} in database
           </p>
         </div>
       </div>
@@ -1228,6 +1359,41 @@ export function Accounts() {
           </span>
         </button>
         <button
+          type="button"
+          onClick={() => setExcludeDuplicates(v => !v)}
+          title="When on, only the most recent secure per email is shown"
+          className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2.5 text-sm font-medium transition ${
+            excludeDuplicates
+              ? "border-[--accent]/50 bg-[--accent]/15 text-[--accent]"
+              : "border-border bg-card/60 text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          <Filter className="h-4 w-4" />
+          No dupes
+        </button>
+        <select
+          value={mcFilter}
+          onChange={e => setMcFilter(e.target.value as McFilter)}
+          title="Filter by Minecraft ownership"
+          className="rounded-lg border border-border bg-card/60 px-3 py-2.5 text-sm font-medium text-foreground outline-none transition focus:border-[--primary] focus:ring-2 focus:ring-[--primary]/30"
+        >
+          <option value="all">All MC types</option>
+          <option value="gamepass">Gamepass</option>
+          <option value="owned">Minecraft owned</option>
+          <option value="no_mc">No MC / check failed</option>
+        </select>
+        <select
+          value={sortMode}
+          onChange={e => setSortMode(e.target.value as SortMode)}
+          title="Sort accounts"
+          className="rounded-lg border border-border bg-card/60 px-3 py-2.5 text-sm font-medium text-foreground outline-none transition focus:border-[--primary] focus:ring-2 focus:ring-[--primary]/30"
+        >
+          <option value="newest">Newest first</option>
+          <option value="oldest">Oldest first</option>
+          <option value="mc_type">MC type: Gamepass → Owned → None</option>
+          <option value="mc_type_rev">MC type: None → Owned → Gamepass</option>
+        </select>
+        <button
           onClick={toggleSelectMode}
           className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2.5 text-sm font-medium transition ${
             selectMode
@@ -1248,7 +1414,7 @@ export function Accounts() {
         </button>
       </div>
 
-      {showExport && <ExportModal accounts={accounts} onClose={() => setShowExport(false)} />}
+      {showExport && <ExportModal accounts={filtered} onClose={() => setShowExport(false)} />}
 
       {filtered.length === 0 ? (
         <div className="flex-1 rounded-2xl border border-border bg-card/40 backdrop-blur flex items-center justify-center">

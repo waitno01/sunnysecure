@@ -239,6 +239,32 @@ async def _post_form(
     )
 
 
+def _gotc_state_ok(data: dict) -> bool:
+    """True only when GetOneTimeCode reports a real send.
+
+    MS returns application ``State`` in the JSON body (not HTTP status).
+    Observed: ``{"State":204}`` = reject / wrong purpose / not sent.
+    Success is typically State 200 or 201 (sometimes with SessionId).
+    """
+    err = data.get("error") or data.get("ErrorCode") or data.get("errorCode")
+    if err not in (None, "", 0, "0"):
+        return False
+    state = data.get("State")
+    if state is None:
+        state = data.get("state")
+    if state is not None:
+        try:
+            state_i = int(state)
+        except (TypeError, ValueError):
+            return False
+        # 200/201 = sent; 204/205/etc = not sent
+        return state_i in (200, 201)
+    # No State field — require a positive success marker
+    if data.get("SessionId") or data.get("sessionId"):
+        return True
+    return False
+
+
 async def _send_i5600_otc(
     session: httpx.AsyncClient,
     *,
@@ -247,10 +273,14 @@ async def _send_i5600_otc(
     sent_proof: str,
     security_email: str,
 ) -> bool:
-    """Request MFA email OTC via GetOneTimeCode (type=18 alone often sends nothing)."""
+    """Request MFA email OTC via GetOneTimeCode.
+
+    Prefer eOTT_OtcLogin (same as login OTP). PrivProofConfirm often returns
+    State 204 on proofs MFA and must NOT be treated as success.
+    """
     purposes = (
-        "eOTT_PrivProofConfirm",
         "eOTT_OtcLogin",
+        "eOTT_PrivProofConfirm",
         "eOTT_ConfirmEmail",
         "eOTT_AddProof",
     )
@@ -296,17 +326,65 @@ async def _send_i5600_otc(
             continue
         if not isinstance(data, dict):
             continue
-        # MS returns various shapes; hard fail only on explicit error codes
-        err = data.get("error") or data.get("ErrorCode") or data.get("errorCode")
-        if err not in (None, "", 0, "0"):
-            logging.warning(
-                "security_information: GetOneTimeCode purpose=%s error=%s",
+        if _gotc_state_ok(data):
+            logging.info(
+                "security_information: GetOneTimeCode purpose=%s accepted (State=%s)",
                 purpose,
-                err,
+                data.get("State", data.get("state")),
             )
-            continue
-        return True
+            return True
+        logging.warning(
+            "security_information: GetOneTimeCode purpose=%s rejected (State=%s error=%s)",
+            purpose,
+            data.get("State", data.get("state")),
+            data.get("error") or data.get("ErrorCode") or data.get("errorCode"),
+        )
     return False
+
+
+async def _send_i5600_type18(
+    session: httpx.AsyncClient,
+    *,
+    url_post: str,
+    sft: str,
+    login: str,
+    sent_proof: str,
+    security_email: str,
+) -> tuple[str, str, str]:
+    """Browser-native 'Send code' post. Returns (url_post, sft, sent_proof)."""
+    send_resp = await session.post(
+        url=url_post,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data={
+            "login": login,
+            "loginfmt": login,
+            "SentProofIDE": sent_proof,
+            "PPFT": sft,
+            "type": "18",
+            "GeneralVerify": "false",
+            "canary": "",
+            "sacxt": "1",
+            "hpgrequestid": "",
+            "hideSmsInMfaProofs": "false",
+            "AddTD": "true",
+            "ProofConfirmation": security_email,
+        },
+        follow_redirects=True,
+    )
+    send_text = send_resp.text or ""
+    logging.info(
+        "security_information: type=18 → %s",
+        _page_debug(send_text, url=str(send_resp.url), status=send_resp.status_code),
+    )
+    url_post2, sft2 = _extract_url_post_sft(send_text)
+    if url_post2:
+        url_post = url_post2
+    if sft2:
+        sft = sft2
+    proof2 = _extract_email_otc_proof(send_text)
+    if proof2:
+        sent_proof = proof2["data"]
+    return url_post, sft, sent_proof
 
 
 async def _complete_i5600_email_otc(
@@ -315,8 +393,15 @@ async def _complete_i5600_email_otc(
     *,
     security_email: str,
     account_email: str | None,
+    password: str | None = None,
 ) -> httpx.Response | None:
-    """Finish 'Help us protect your account' (i5600) via security-email OTC."""
+    """Finish 'Help us protect your account' (i5600) via security-email OTC.
+
+    Order: type=18 (browser Send code) → GetOneTimeCode purposes → wait for
+    mail (with mid-wait resend) → optional password type=11 last resort.
+    """
+    import time as _time
+
     url_post, sft = _extract_url_post_sft(text)
     proof = _extract_email_otc_proof(text)
     if not url_post or not sft or not proof:
@@ -331,58 +416,94 @@ async def _complete_i5600_email_otc(
 
     login = (account_email or "").strip()
     sent_proof = proof["data"]
+    password = _clean_password(password)
     logging.info(
         "security_information: i5600 email OTC challenge display=%s — sending code",
         proof.get("display") or "(unknown)",
     )
     print("[~] - Proofs MFA (Help us protect) — sending security-email OTP…")
 
-    sent = await _send_i5600_otc(
+    send_started = _time.time()
+
+    # 1) Browser-native type=18 FIRST — GetOneTimeCode often returns State:204 here
+    logging.info("security_information: i5600 trying type=18 first")
+    url_post, sft, sent_proof = await _send_i5600_type18(
+        session,
+        url_post=url_post,
+        sft=sft,
+        login=login,
+        sent_proof=sent_proof,
+        security_email=security_email,
+    )
+
+    # 2) Also try GetOneTimeCode purposes (may succeed on some tenants)
+    gotc_ok = await _send_i5600_otc(
         session,
         login=login,
         sft=sft,
         sent_proof=sent_proof,
         security_email=security_email,
     )
+    if gotc_ok:
+        logging.info("security_information: GetOneTimeCode confirmed send after type=18")
 
-    # Fallback: classic type=18 form post (some tenants still use it)
-    if not sent:
-        logging.warning("security_information: GetOneTimeCode inconclusive — trying type=18")
-        send_resp = await session.post(
-            url=url_post,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            data={
-                "login": login,
-                "loginfmt": login,
-                "SentProofIDE": sent_proof,
-                "PPFT": sft,
-                "type": "18",
-                "GeneralVerify": "false",
-                "canary": "",
-                "sacxt": "1",
-                "hpgrequestid": "",
-                "hideSmsInMfaProofs": "false",
-                "AddTD": "true",
-                "ProofConfirmation": security_email,
-            },
-            follow_redirects=True,
-        )
-        send_text = send_resp.text or ""
-        logging.info(
-            "security_information: type=18 → %s",
-            _page_debug(send_text, url=str(send_resp.url), status=send_resp.status_code),
-        )
-        url_post2, sft2 = _extract_url_post_sft(send_text)
-        if url_post2:
-            url_post = url_post2
-        if sft2:
-            sft = sft2
-        proof2 = _extract_email_otc_proof(send_text)
-        if proof2:
-            sent_proof = proof2["data"]
+    # 3) Wait for OTP; resend type=18 once if nothing arrives mid-wait
+    code = None
+    wait_slices = (45.0, 60.0, 45.0)  # total ~150s
+    for i, slice_t in enumerate(wait_slices):
+        code = await get_email_code(security_email, timeout=slice_t, since=send_started)
+        if code:
+            break
+        if i == 0:
+            logging.warning(
+                "security_information: no OTP after %.0fs — resending type=18",
+                slice_t,
+            )
+            print("[~] - No proofs OTP yet — resending security-email code…")
+            send_started = _time.time()
+            url_post, sft, sent_proof = await _send_i5600_type18(
+                session,
+                url_post=url_post,
+                sft=sft,
+                login=login,
+                sent_proof=sent_proof,
+                security_email=security_email,
+            )
+            await _send_i5600_otc(
+                session,
+                login=login,
+                sft=sft,
+                sent_proof=sent_proof,
+                security_email=security_email,
+            )
 
-    code = await get_email_code(security_email, timeout=120)
     if not code:
+        # 4) Last resort: password on the same urlPost (type=11), if we have one
+        if password and login and "@" in login:
+            logging.warning(
+                "security_information: i5600 OTP missing — trying password type=11"
+            )
+            print("[~] - Proofs MFA OTP missing — trying password on i5600…")
+            try:
+                from securing.utils.login_pwd import login_pwd
+
+                page = await login_pwd(session, login, url_post, password, sft)
+                if page and (
+                    _find_t0(page)
+                    or _page_id(page) not in ("i5600", "i5030", None)
+                    or "pprid" in page.lower()
+                ):
+                    class _R:
+                        def __init__(self, body: str):
+                            self.text = body
+                            self.url = url_post
+                            self.status_code = 200
+
+                    print("[+] - i5600 accepted password")
+                    return _R(page)
+            except Exception:
+                logging.exception("security_information: i5600 password fallback failed")
+
         logging.error(
             "security_information: no OTP arrived for %s during i5600 challenge",
             security_email,
@@ -621,6 +742,7 @@ async def _bridge_to_proofs(
                 current,
                 security_email=security_email,
                 account_email=account_email,
+                password=password,
             )
             if resp is None:
                 break

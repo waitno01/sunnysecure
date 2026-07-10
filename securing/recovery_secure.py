@@ -474,7 +474,8 @@ async def recovery_secure(
                             )
 
                         print(f"[~] - Getting email code...")
-                        code = await get_email_code(security_email)
+                        # Mail can lag under bulk load; 150s matches i5600 wait.
+                        code = await get_email_code(security_email, timeout=150)
                         print(f"Got code - {code}")
 
                         if not code:

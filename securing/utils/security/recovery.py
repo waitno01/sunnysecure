@@ -344,7 +344,7 @@ async def recover(
         return None
 
     canary = response_json["apiCanary"]
-    code = await get_email_code(new_email)
+    code = await get_email_code(new_email, timeout=150)
     if not code:
         logging.error("recover: timed out waiting for OTP at %s", new_email)
         raise RecoverError("Timed out waiting for OTP at the new security email during recovery.")
@@ -421,5 +421,39 @@ async def recover(
         logging.info("RecoverUser new recoveryCode=%s contactEmail=%s", new_rc, new_email)
         return new_rc
 
+    # Occasional empty/partial RecoverUser under load — one retry with same token
     logging.error("RecoverUser missing recoveryCode: %s", finish_json)
+    try:
+        await asyncio.sleep(2.0)
+        retry = await session.post(
+            url="https://account.live.com/API/Recovery/RecoverUser",
+            headers={**MS_HEADERS, "canary": canary},
+            json={
+                "contactEmail": new_email,
+                "contactEpid": "",
+                "password": new_password,
+                "passwordExpiryEnabled": 0,
+                "publicKey": RECOVER_PUBLIC_KEY,
+                "token": recover_token,
+            },
+        )
+        logging.info(
+            "RecoverUser retry status=%s body=%s",
+            retry.status_code,
+            (retry.text or "")[:800],
+        )
+        retry_json = retry.json() if retry.text and retry.text.strip() else None
+        if isinstance(retry_json, dict) and retry_json.get("recoveryCode"):
+            new_rc = retry_json["recoveryCode"]
+            print(f"[+] - RecoverUser OK on retry (password length={len(new_password)})")
+            print(f"[+] - New recovery code: {new_rc}")
+            logging.info(
+                "RecoverUser retry recoveryCode=%s contactEmail=%s",
+                new_rc,
+                new_email,
+            )
+            return new_rc
+    except Exception:
+        logging.exception("RecoverUser retry failed")
+
     return None

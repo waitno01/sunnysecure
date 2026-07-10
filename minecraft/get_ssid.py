@@ -49,7 +49,7 @@ async def get_ssid(xbl: str) -> str | None:
     return await with_retries(
         "get_ssid",
         lambda: _get_ssid_once(xbl),
-        attempts=5,
-        base_delay=5.0,
+        attempts=8,
+        base_delay=6.0,
         retry_on_none=False,
     )
