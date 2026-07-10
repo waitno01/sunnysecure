@@ -252,16 +252,42 @@ async def recover(
         (data.text or "")[:1200],
     )
 
-    server_data = _extract_server_data(data.text or "")
+    body_text = data.text or ""
+    body_l = body_text.lower()
+    # MS rate-limit / bot challenge on ResetPassword — retryable via proxy rotate
+    if (
+        len(body_text) < 500
+        and (
+            "please retry after sometime" in body_l
+            or "try using a different device or network" in body_l
+            or "too many requests" in body_l
+        )
+    ):
+        logging.error(
+            "recover: ResetPassword rate-limited for %s body=%r",
+            email,
+            body_text[:200],
+        )
+        raise httpx.RemoteProtocolError(
+            f"ResetPassword rate-limited/blocked for {email}"
+        )
+
+    server_data = _extract_server_data(body_text)
     if not server_data or "sRecoveryToken" not in server_data or "apiCanary" not in server_data:
-        title_m = re.search(r"<title[^>]*>(.*?)</title>", data.text or "", re.I | re.S)
+        title_m = re.search(r"<title[^>]*>(.*?)</title>", body_text, re.I | re.S)
         title = re.sub(r"\s+", " ", title_m.group(1)).strip()[:80] if title_m else "?"
         logging.error(
-            "recover: could not parse ServerData for %s (keys=%s title=%s)",
+            "recover: could not parse ServerData for %s (keys=%s title=%s len=%s)",
             email,
             list(server_data.keys())[:20] if server_data else None,
             title,
+            len(body_text),
         )
+        # Short non-HTML bodies are usually proxy flakes — make retryable
+        if len(body_text) < 800 or "<html" not in body_l:
+            raise httpx.RemoteProtocolError(
+                f"ResetPassword unparseable/short response for {email} (len={len(body_text)})"
+            )
         raise RecoverError(
             "Recovery page could not be parsed (ServerData/sRecoveryToken missing). Retry."
         )

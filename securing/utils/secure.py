@@ -47,13 +47,56 @@ MC_CHECK_FAILED_LABEL = "Unknown (MC check failed)"
 
 
 def _copy_cookies(src: httpx.AsyncClient) -> httpx.Cookies:
-    """Copy auth cookies into a new jar (avoids sharing the proxied transport)."""
+    """Copy auth cookies into a new jar (avoids sharing the proxied transport).
+
+    Critically preserves ``__Host-MSAAUTH`` / ``__Secure-*`` host-only + Secure
+    flags. A naive ``Cookies.set(..., domain=...)`` drop of ``secure`` causes
+    Xbox sisu SSO to land on a login HTML page (no Location) → false MC-check fails.
+    """
+    from http.cookiejar import Cookie as JarCookie
+
     jar = httpx.Cookies()
     for c in iter_cookies(src):
+        secure = bool(getattr(c, "secure", False)) or c.name.startswith(
+            ("__Host-", "__Secure-")
+        )
+        domain = c.domain or ""
+        # __Host- cookies must not carry a Domain attribute
+        if c.name.startswith("__Host-"):
+            domain = ""
+            domain_specified = False
+            domain_initial_dot = False
+            secure = True
+        else:
+            domain_specified = bool(getattr(c, "domain_specified", bool(domain)))
+            domain_initial_dot = domain.startswith(".") if domain else False
         try:
-            jar.set(c.name, c.value, domain=c.domain or None, path=c.path or "/")
+            jar.jar.set_cookie(
+                JarCookie(
+                    version=0,
+                    name=c.name,
+                    value=c.value,
+                    port=None,
+                    port_specified=False,
+                    domain=domain,
+                    domain_specified=domain_specified,
+                    domain_initial_dot=domain_initial_dot,
+                    path=c.path or "/",
+                    path_specified=True,
+                    secure=secure,
+                    expires=getattr(c, "expires", None),
+                    discard=True,
+                    comment=None,
+                    comment_url=None,
+                    rest={"HttpOnly": None},
+                    rfc2109=False,
+                )
+            )
         except Exception:
-            jar.set(c.name, c.value)
+            try:
+                jar.set(c.name, c.value, domain=domain or None, path=c.path or "/")
+            except Exception:
+                jar.set(c.name, c.value)
     return jar
 
 
@@ -259,7 +302,15 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
     # 2FA
     await remove_2fa(session, apicanary)
 
-    security_parameters = json.loads(await security_information(session))
+    ms = account_info.get("microsoft") or {}
+    security_parameters = json.loads(
+        await security_information(
+            session,
+            security_email=ms.get("security_email"),
+            account_email=ms.get("email"),
+            password=ms.get("password"),
+        )
+    )
     main_email = security_parameters.get("email") or account_info["microsoft"].get("email")
     # Seed primary immediately so partial failures still show the real address
     if main_email and main_email != "Couldn't Change!":
