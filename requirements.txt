@@ -12,3 +12,4 @@ PyJWT
 python-multipart
 slowapi
 argon2-cffi
+bitcoinlib

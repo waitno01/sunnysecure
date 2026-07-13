@@ -4,6 +4,7 @@
     "real": {
       "accounts": false,
       "auth_code": true,
+      "autobuy": true,
       "check_lock": true,
       "config": false,
       "email": true,
@@ -18,6 +19,7 @@
     "fake": {},
     "aliases": {
       "auth_code": "auth_code",
+      "autobuy": "autobuy",
       "check_lock": "check",
       "email": "email",
       "goon": "goon",

@@ -53,7 +53,7 @@ export function ExportModal({ accounts, onClose }: { accounts: Account[]; onClos
         username: a.mc_name ?? a.mc_gamertag ?? "",
         email: a.ms_email ?? "",
         security_email: a.ms_security_email ?? "",
-        password: a.ms_password ?? "",
+        password: (a.ms_password ?? "").replace(/\s*\(UNVERIFIED[^)]*\)\s*$/i, "").trim(),
         recovery: a.ms_recovery_code ?? "",
         auth_secret: a.ms_auth_secret ?? "",
         capes: a.mc_capes ?? "",

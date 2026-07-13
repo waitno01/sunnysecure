@@ -78,6 +78,44 @@ class DBConnection:
                 access_count INTEGER DEFAULT 0,
                 FOREIGN KEY (account_id) REFERENCES secured_accounts(account_id)
             );
+
+            CREATE TABLE IF NOT EXISTS `autobuy_users` (
+                discord_id INTEGER PRIMARY KEY,
+                ltc_address TEXT NOT NULL,
+                linked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS `autobuy_credits` (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                discord_id INTEGER NOT NULL,
+                amount_usd REAL NOT NULL,
+                remaining_usd REAL NOT NULL,
+                available_at TIMESTAMP NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                source TEXT,
+                email TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS `autobuy_sells` (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                discord_id INTEGER NOT NULL,
+                email TEXT NOT NULL,
+                success INTEGER NOT NULL DEFAULT 0,
+                credit_id INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS `autobuy_withdrawals` (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                discord_id INTEGER NOT NULL,
+                amount_usd REAL NOT NULL,
+                amount_ltc REAL,
+                ltc_address TEXT NOT NULL,
+                txid TEXT,
+                status TEXT NOT NULL,
+                error TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
         """)
         self.conn.commit()
 
@@ -392,3 +430,163 @@ class DBConnection:
 
     def get_shared_links_count(self) -> int:
         return self.cursor.execute("SELECT COUNT(*) FROM shared_links").fetchone()[0]
+
+    # Autobuy
+    def autobuy_set_ltc(self, discord_id: int, ltc_address: str) -> None:
+        self.cursor.execute("""
+            INSERT INTO autobuy_users (discord_id, ltc_address, linked_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(discord_id) DO UPDATE SET
+                ltc_address = excluded.ltc_address,
+                linked_at = CURRENT_TIMESTAMP
+        """, (discord_id, ltc_address))
+        self.conn.commit()
+
+    def autobuy_get_ltc(self, discord_id: int) -> str | None:
+        row = self.cursor.execute(
+            "SELECT ltc_address FROM autobuy_users WHERE discord_id = ?",
+            (discord_id,),
+        ).fetchone()
+        return row[0] if row else None
+
+    def autobuy_add_credit(
+        self,
+        discord_id: int,
+        amount_usd: float,
+        available_at: str,
+        source: str,
+        email: str,
+    ) -> int:
+        self.cursor.execute("""
+            INSERT INTO autobuy_credits
+                (discord_id, amount_usd, remaining_usd, available_at, source, email)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (discord_id, amount_usd, amount_usd, available_at, source, email))
+        self.conn.commit()
+        return int(self.cursor.lastrowid)
+
+    def autobuy_record_sell(
+        self,
+        discord_id: int,
+        email: str,
+        success: bool,
+        credit_id: int | None = None,
+    ) -> None:
+        self.cursor.execute("""
+            INSERT INTO autobuy_sells (discord_id, email, success, credit_id)
+            VALUES (?, ?, ?, ?)
+        """, (discord_id, email, 1 if success else 0, credit_id))
+        self.conn.commit()
+
+    def autobuy_sells_today(self, discord_id: int) -> int:
+        row = self.cursor.execute("""
+            SELECT COUNT(*) FROM autobuy_sells
+            WHERE discord_id = ?
+              AND success = 1
+              AND DATE(created_at) = DATE('now')
+        """, (discord_id,)).fetchone()
+        return int(row[0] or 0)
+
+    def autobuy_balances(self, discord_id: int) -> dict:
+        pending = self.cursor.execute("""
+            SELECT COALESCE(SUM(remaining_usd), 0) FROM autobuy_credits
+            WHERE discord_id = ?
+              AND remaining_usd > 0
+              AND available_at > CURRENT_TIMESTAMP
+        """, (discord_id,)).fetchone()[0]
+        available = self.cursor.execute("""
+            SELECT COALESCE(SUM(remaining_usd), 0) FROM autobuy_credits
+            WHERE discord_id = ?
+              AND remaining_usd > 0
+              AND available_at <= CURRENT_TIMESTAMP
+        """, (discord_id,)).fetchone()[0]
+        return {
+            "pending_usd": float(pending or 0),
+            "available_usd": float(available or 0),
+            "total_usd": float(pending or 0) + float(available or 0),
+        }
+
+    def autobuy_consume_credits(self, discord_id: int, amount_usd: float) -> list[tuple[int, float]]:
+        """Consume available credits FIFO. Returns list of (credit_id, taken_usd)."""
+        if amount_usd <= 0:
+            return []
+        rows = self.cursor.execute("""
+            SELECT id, remaining_usd FROM autobuy_credits
+            WHERE discord_id = ?
+              AND remaining_usd > 0
+              AND available_at <= CURRENT_TIMESTAMP
+            ORDER BY available_at ASC, id ASC
+        """, (discord_id,)).fetchall()
+
+        remaining = round(float(amount_usd), 8)
+        taken: list[tuple[int, float]] = []
+        for credit_id, rem in rows:
+            if remaining <= 0:
+                break
+            rem = float(rem)
+            use = min(rem, remaining)
+            new_rem = round(rem - use, 8)
+            self.cursor.execute(
+                "UPDATE autobuy_credits SET remaining_usd = ? WHERE id = ?",
+                (new_rem, credit_id),
+            )
+            taken.append((int(credit_id), use))
+            remaining = round(remaining - use, 8)
+
+        if remaining > 0.0001:
+            # rollback partial consumption in this connection by reverting
+            for credit_id, use in taken:
+                self.cursor.execute(
+                    "UPDATE autobuy_credits SET remaining_usd = remaining_usd + ? WHERE id = ?",
+                    (use, credit_id),
+                )
+            self.conn.commit()
+            return []
+
+        self.conn.commit()
+        return taken
+
+    def autobuy_refund_credits(self, taken: list[tuple[int, float]]) -> None:
+        for credit_id, used in taken:
+            self.cursor.execute(
+                "UPDATE autobuy_credits SET remaining_usd = remaining_usd + ? WHERE id = ?",
+                (used, credit_id),
+            )
+        self.conn.commit()
+
+    def autobuy_add_withdrawal(
+        self,
+        discord_id: int,
+        amount_usd: float,
+        amount_ltc: float | None,
+        ltc_address: str,
+        status: str,
+        txid: str | None = None,
+        error: str | None = None,
+    ) -> int:
+        self.cursor.execute("""
+            INSERT INTO autobuy_withdrawals
+                (discord_id, amount_usd, amount_ltc, ltc_address, txid, status, error)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (discord_id, amount_usd, amount_ltc, ltc_address, txid, status, error))
+        self.conn.commit()
+        return int(self.cursor.lastrowid)
+
+    def autobuy_update_withdrawal(
+        self,
+        withdrawal_id: int,
+        *,
+        status: str,
+        txid: str | None = None,
+        amount_ltc: float | None = None,
+        error: str | None = None,
+    ) -> None:
+        self.cursor.execute("""
+            UPDATE autobuy_withdrawals
+            SET status = ?,
+                txid = COALESCE(?, txid),
+                amount_ltc = COALESCE(?, amount_ltc),
+                error = COALESCE(?, error)
+            WHERE id = ?
+        """, (status, txid, amount_ltc, error, withdrawal_id))
+        self.conn.commit()

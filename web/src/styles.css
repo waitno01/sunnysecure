@@ -386,6 +386,9 @@ input.custom-range::-moz-range-thumb {
   white-space: nowrap;
   min-width: 0;
   flex: 1;
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
 }
 
 .db-detail-stat-copy {

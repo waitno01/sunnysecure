@@ -21,8 +21,9 @@ function CopyableValue({ value, mono, breakAll, title, muted, italic, className 
         ...(breakAll ? { wordBreak: "break-all", whiteSpace: "normal" } : {}),
         ...(muted ? { color: "var(--muted-foreground)", opacity: 0.6 } : {}),
         ...(italic ? { fontStyle: "italic" } : {}),
-        cursor: "pointer",
-        userSelect: "none",
+        cursor: "text",
+        userSelect: "text",
+        WebkitUserSelect: "text",
       }}
     >
       {hasValue ? value : (muted ? "None" : "—")}
@@ -541,7 +542,7 @@ export function AccountDetail({ account, onBack }: { account: Account; onBack: (
                     <span
                       onDoubleClick={() => { navigator.clipboard.writeText(`${domain}/share/${link.id}`); toast.success("Link copied to clipboard"); }}
                       title="Double-click to copy"
-                      style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: '"JetBrains Mono", monospace', fontSize: "0.75rem", color: "var(--muted-foreground)", cursor: "pointer", userSelect: "none" }}
+                      style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: '"JetBrains Mono", monospace', fontSize: "0.75rem", color: "var(--muted-foreground)", cursor: "text", userSelect: "text" }}
                     >
                       {domain}/share/{link.id}
                     </span>
@@ -652,7 +653,7 @@ export function AccountDetail({ account, onBack }: { account: Account; onBack: (
               {listModal.items.map((item, i) => (
                 <div key={i} className="rounded-lg border border-border/40 bg-background/40 p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap break-all"
                   onDoubleClick={() => { const text = typeof item === "object" && item !== null ? Object.entries(item).map(([k, v]) => `${k}: ${v}`).join("\n") : String(item); navigator.clipboard.writeText(text); toast.success("Copied to clipboard"); }}
-                  title="Double-click to copy" style={{ cursor: "pointer", userSelect: "none" }}>
+                  title="Double-click to copy" style={{ cursor: "text", userSelect: "text" }}>
                   {typeof item === "object" && item !== null
                     ? Object.entries(item).map(([k, v]) => `${k}: ${v}`).join("\n")
                     : String(item)}
