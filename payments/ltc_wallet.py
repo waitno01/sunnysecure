@@ -161,16 +161,23 @@ class LtcWallet:
         except Exception:
             logger.exception("LTC utxos_update before send failed")
 
-        # bitcoinlib send_to expects amount in BTC/LTC units when offline=False
+        # bitcoinlib 0.7: use broadcast=True (no offline= kwarg)
         tx = w.send_to(
             to_address,
             amount_ltc,
             fee="normal",
-            offline=False,
+            broadcast=True,
         )
         txid = getattr(tx, "txid", None) or getattr(tx, "hash", None)
         if not txid and isinstance(tx, dict):
             txid = tx.get("txid") or tx.get("hash")
+        # Transaction object may expose .txid as method/property after broadcast
+        if not txid and hasattr(tx, "as_dict"):
+            try:
+                d = tx.as_dict()
+                txid = d.get("txid") or d.get("hash")
+            except Exception:
+                pass
         if not txid:
             raise RuntimeError("LTC send completed but no txid was returned")
         return str(txid)
