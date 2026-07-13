@@ -17,6 +17,76 @@ def _autobuy_cfg() -> dict:
         return json.load(f).get("autobuy") or {}
 
 
+async def _send_seller_success_dm(
+    user: discord.abc.User,
+    *,
+    hits: int,
+    fails: int,
+    earned: float,
+    price: float,
+    pending_hours: int,
+    unlock_ts: int | None,
+    bals: dict,
+    sold_today: int,
+    max_day: int,
+    details: list[str],
+) -> None:
+    """Fancy payout receipt DM after successful MFA sells."""
+    if unlock_ts is None:
+        unlock_ts = int(
+            (datetime.now(timezone.utc) + timedelta(hours=pending_hours)).timestamp()
+        )
+
+    noun = "account" if hits == 1 else "accounts"
+    embed = discord.Embed(
+        title="Sale Confirmed",
+        description=(
+            f"**{hits}** {noun} successfully secured.\n"
+            f"You earned **${earned:.2f}** "
+            f"({hits} × ${price:.2f})."
+        ),
+        color=0x57F287,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Accounts Secured", value=f"**{hits}**", inline=True)
+    embed.add_field(name="Total Earned", value=f"**${earned:.2f}**", inline=True)
+    if fails:
+        embed.add_field(name="Failed", value=f"**{fails}**", inline=True)
+
+    embed.add_field(
+        name="Payout Unlock",
+        value=(
+            f"Credits unlock <t:{unlock_ts}:R>\n"
+            f"<t:{unlock_ts}:F>\n"
+            f"_Each credit has its own {pending_hours}h timer._"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Wallet",
+        value=(
+            f"Available · **${bals['available_usd']:.2f}**\n"
+            f"Pending · **${bals['pending_usd']:.2f}**\n"
+            f"Sold today · **{sold_today}/{max_day}**"
+        ),
+        inline=False,
+    )
+
+    success_lines = [d for d in details if "— +$" in d]
+    if success_lines:
+        body = "\n".join(success_lines)
+        if len(body) > 900:
+            body = body[:897] + "..."
+        embed.add_field(name="Secured", value=body, inline=False)
+
+    embed.set_footer(text="Account Selling Service • Withdraw after unlock")
+
+    try:
+        await user.send(embed=embed)
+    except discord.HTTPException:
+        logger.warning("Could not DM sell receipt to user %s", getattr(user, "id", "?"))
+
+
 class LinkLtcModal(ui.Modal):
     def __init__(self):
         super().__init__(title="Link LTC Address")
@@ -232,6 +302,7 @@ class SellMfaModal(ui.Modal):
         fails = 0
         details: list[str] = []
         earned = 0.0
+        unlock_ts: int | None = None
 
         accounts_channel_id = None
         try:
@@ -297,9 +368,9 @@ class SellMfaModal(ui.Modal):
                     db.autobuy_record_sell(interaction.user.id, email, False)
                 continue
 
-            available_at = (
-                datetime.now(timezone.utc) + timedelta(hours=pending_hours)
-            ).strftime("%Y-%m-%d %H:%M:%S")
+            unlock_dt = datetime.now(timezone.utc) + timedelta(hours=pending_hours)
+            available_at = unlock_dt.strftime("%Y-%m-%d %H:%M:%S")
+            unlock_ts = int(unlock_dt.timestamp())
 
             with DBConnection() as db:
                 credit_id = db.autobuy_add_credit(
@@ -360,3 +431,18 @@ class SellMfaModal(ui.Modal):
             await msg.edit(embed=summary)
         except discord.HTTPException:
             await interaction.followup.send(embed=summary, ephemeral=True)
+
+        if hits > 0:
+            await _send_seller_success_dm(
+                interaction.user,
+                hits=hits,
+                fails=fails,
+                earned=earned,
+                price=price,
+                pending_hours=pending_hours,
+                unlock_ts=unlock_ts,
+                bals=bals,
+                sold_today=sold_today,
+                max_day=max_day,
+                details=details,
+            )
