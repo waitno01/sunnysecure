@@ -64,6 +64,16 @@ class SellMfaButton(discord.ui.Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
+        with DBConnection() as db:
+            ltc = db.autobuy_get_ltc(interaction.user.id)
+
+        if not ltc:
+            await interaction.response.send_message(
+                "Link an LTC address first using **Link LTC**.",
+                ephemeral=True,
+            )
+            return
+
         await interaction.response.send_modal(SellMfaModal())
 
 

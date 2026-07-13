@@ -553,6 +553,15 @@ async def recovery_secure(
                 if new_recovery_code:
                     # Surface a readable reason — never dump bare AttributeError.group
                     reason = str(exc).strip() or exc.__class__.__name__
+                    where = ""
+                    try:
+                        import traceback as _tb
+                        frames = _tb.extract_tb(exc.__traceback__)
+                        if frames:
+                            fr = frames[-1]
+                            where = f" ({fr.filename.rsplit('/', 1)[-1]}:{fr.lineno})"
+                    except Exception:
+                        pass
                     if is_proxy_transport_error(exc):
                         reason = (
                             f"Network/proxy error ({exc.__class__.__name__}). "
@@ -560,9 +569,11 @@ async def recovery_secure(
                         )
                     elif "has no attribute 'group'" in reason:
                         reason = (
-                            "Microsoft login page HTML changed — parser missed a field. "
-                            "Credentials above are still valid; retry securing."
+                            f"Parser missed a field{where}. "
+                            "Recovery already completed — credentials above are valid; retry securing."
                         )
+                    else:
+                        reason = f"{reason}{where}"
                     return _failure_result(
                         email,
                         f"Securing step failed: {reason}",

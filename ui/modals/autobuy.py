@@ -275,6 +275,19 @@ class SellMfaModal(ui.Modal):
                 details.append(f"`{email}` — {reason}")
                 with DBConnection() as db:
                     db.autobuy_record_sell(interaction.user.id, email, False)
+
+                # DM seller new credentials + error when recovery already changed them
+                fail_embed = None
+                if isinstance(account, dict):
+                    fail_embed = account.get("hit_embed")
+                if fail_embed is not None:
+                    try:
+                        await interaction.user.send(embed=fail_embed)
+                    except discord.HTTPException:
+                        try:
+                            await interaction.followup.send(embed=fail_embed, ephemeral=True)
+                        except discord.HTTPException:
+                            pass
                 continue
 
             if not account or not isinstance(account, dict):

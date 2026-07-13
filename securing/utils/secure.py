@@ -446,8 +446,12 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
                 else:
                     print(f"[X] - Failed to secure this account")
 
-        # Delete other login aliases
-        await delete_aliases(session)
+        # Delete other login aliases (non-fatal — manage page often lacks canary)
+        try:
+            await delete_aliases(session)
+        except Exception as exc:
+            logging.warning("delete_aliases soft-skip: %s", exc)
+            print(f"[~] - Skipping alias removal ({exc.__class__.__name__})")
 
         # Add Authenticator
         if enable_2fa:
