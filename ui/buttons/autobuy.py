@@ -11,6 +11,8 @@ logger = logging.getLogger("bot")
 
 # Last published panel fingerprint — skip Discord edits when unchanged
 _last_panel_fp: str | None = None
+# Last known wallet snapshot for instant embeds (no network on button click)
+_last_snapshot: dict | None = None
 
 
 def _autobuy_cfg() -> dict:
@@ -37,11 +39,13 @@ async def refresh_autobuy_panels(bot: discord.Client, *, force: bool = False) ->
     Uses explorer balance so deposits appear without button interaction.
     Returns number of messages successfully edited.
     """
-    global _last_panel_fp
+    global _last_panel_fp, _last_snapshot
 
     fp, snap = await asyncio.to_thread(_wallet_fingerprint_sync)
     if fp is None:
         return 0
+    if snap is not None:
+        _last_snapshot = snap
     if not force and _last_panel_fp is not None and fp == _last_panel_fp:
         return 0
 
@@ -52,7 +56,7 @@ async def refresh_autobuy_panels(bot: discord.Client, *, force: bool = False) ->
         _last_panel_fp = fp
         return 0
 
-    embed = build_autobuy_embed(snapshot=snap)
+    embed = build_autobuy_embed(snapshot=snap, allow_network=False)
     view = AutobuyView()
     edited = 0
 
@@ -91,6 +95,29 @@ def _wallet_fingerprint_sync() -> tuple[str | None, dict | None]:
     return _wallet_fingerprint()
 
 
+async def _bg_refresh_message(message: discord.Message | None) -> None:
+    """Refresh panel embed after the interaction was already acknowledged."""
+    if message is None:
+        return
+    try:
+        # Prefer cached snapshot; background task can refresh from network
+        snap = _last_snapshot
+        try:
+            from payments.ltc_wallet import get_ltc_wallet
+
+            snap = await asyncio.to_thread(
+                lambda: get_ltc_wallet().balance_snapshot()
+            )
+        except Exception:
+            pass
+        await message.edit(
+            embed=build_autobuy_embed(snapshot=snap, allow_network=False),
+            view=AutobuyView(),
+        )
+    except Exception:
+        logger.debug("bg panel refresh failed", exc_info=True)
+
+
 class LinkLtcButton(discord.ui.Button):
     def __init__(self):
         super().__init__(
@@ -100,12 +127,12 @@ class LinkLtcButton(discord.ui.Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        try:
-            if interaction.message:
-                await interaction.message.edit(embed=build_autobuy_embed(), view=AutobuyView())
-        except Exception:
-            pass
-        await interaction.response.send_modal(LinkLtcModal())
+        # ACK FIRST — never do network before responding (Discord 3s limit)
+        with DBConnection() as db:
+            current = db.autobuy_get_ltc(interaction.user.id)
+
+        await interaction.response.send_modal(LinkLtcModal(current_address=current))
+        asyncio.create_task(_bg_refresh_message(interaction.message))
 
 
 class WithdrawButton(discord.ui.Button):
@@ -117,12 +144,6 @@ class WithdrawButton(discord.ui.Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        try:
-            if interaction.message:
-                await interaction.message.edit(embed=build_autobuy_embed(), view=AutobuyView())
-        except Exception:
-            pass
-
         with DBConnection() as db:
             bals = db.autobuy_balances(interaction.user.id)
             ltc = db.autobuy_get_ltc(interaction.user.id)
@@ -132,6 +153,7 @@ class WithdrawButton(discord.ui.Button):
                 "Link an LTC address first using **Link LTC**.",
                 ephemeral=True,
             )
+            asyncio.create_task(_bg_refresh_message(interaction.message))
             return
 
         if bals["available_usd"] <= 0:
@@ -141,9 +163,11 @@ class WithdrawButton(discord.ui.Button):
                 f"Pending (24h): **${bals['pending_usd']:.2f}**",
                 ephemeral=True,
             )
+            asyncio.create_task(_bg_refresh_message(interaction.message))
             return
 
         await interaction.response.send_modal(WithdrawModal(bals["available_usd"]))
+        asyncio.create_task(_bg_refresh_message(interaction.message))
 
 
 class SellMfaButton(discord.ui.Button):
@@ -155,12 +179,6 @@ class SellMfaButton(discord.ui.Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        try:
-            if interaction.message:
-                await interaction.message.edit(embed=build_autobuy_embed(), view=AutobuyView())
-        except Exception:
-            pass
-
         with DBConnection() as db:
             ltc = db.autobuy_get_ltc(interaction.user.id)
 
@@ -169,9 +187,11 @@ class SellMfaButton(discord.ui.Button):
                 "Link an LTC address first using **Link LTC**.",
                 ephemeral=True,
             )
+            asyncio.create_task(_bg_refresh_message(interaction.message))
             return
 
         await interaction.response.send_modal(SellMfaModal())
+        asyncio.create_task(_bg_refresh_message(interaction.message))
 
 
 class AutobuyView(discord.ui.View):
@@ -182,7 +202,12 @@ class AutobuyView(discord.ui.View):
         self.add_item(SellMfaButton())
 
 
-def build_autobuy_embed(snapshot: dict | None = None) -> discord.Embed:
+def build_autobuy_embed(
+    snapshot: dict | None = None,
+    *,
+    allow_network: bool = True,
+) -> discord.Embed:
+    global _last_snapshot
     cfg = _autobuy_cfg()
     emb = cfg.get("embed") or {}
     price = float(cfg.get("price_per_mfa") or 5.0)
@@ -201,13 +226,18 @@ def build_autobuy_embed(snapshot: dict | None = None) -> discord.Embed:
 
     ltc_usd_line = "LTC Balance: unavailable"
     try:
-        if snapshot is None:
+        if snapshot is None and allow_network:
             from payments.ltc_wallet import get_ltc_wallet
 
             snapshot = get_ltc_wallet().balance_snapshot()
-        usd = float(snapshot.get("usd") or 0)
-        ltc = float(snapshot.get("ltc") or 0)
-        ltc_usd_line = f"LTC Balance: **${usd:.2f}** ({ltc:.8f} LTC)"
+        elif snapshot is None:
+            snapshot = _last_snapshot
+
+        if snapshot:
+            _last_snapshot = snapshot
+            usd = float(snapshot.get("usd") or 0)
+            ltc = float(snapshot.get("ltc") or 0)
+            ltc_usd_line = f"LTC Balance: **${usd:.2f}** ({ltc:.8f} LTC)"
     except Exception:
         logger.exception("build_autobuy_embed balance failed")
 

@@ -415,7 +415,7 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
                 account_info["microsoft"]["email"] = main_email
             if replace_alias:
                 print("[~] - Changing Primary Alias")
-                primaryEmail = f"auto{uuid.uuid4().hex[:12]}"
+                primaryEmail = f"sunny{uuid.uuid4().hex[:12]}"
                 changed = await change_primary_alias(session, primaryEmail, apicanary)
                 if changed:
                     account_info["microsoft"]["email"] = f"{primaryEmail}@outlook.com"

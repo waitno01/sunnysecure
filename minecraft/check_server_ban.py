@@ -227,8 +227,57 @@ async def apply_ban_checks(account: dict) -> str | None:
             detail = reason
             if ban_id:
                 detail = f"{reason} (Ban ID #{ban_id})"
+            # Infrastructure / script failures must not reject the account
+            soft = str(reason or "").lower()
+            if any(
+                x in soft
+                for x in (
+                    "syntaxerror",
+                    "bad json",
+                    "script missing",
+                    "failed to start",
+                    "subprocess timed out",
+                    "empty output",
+                    "missing --host",
+                    "no java profile",
+                    "socketclosed",
+                    "transient",
+                    "assumed banned",
+                )
+            ) and not re.search(r"\bbanned\b|ban\s*id|#\w+", soft):
+                logger.error(
+                    "ban check %s infrastructure failure — NOT rejecting: %s",
+                    key,
+                    reason,
+                )
+                print(f"[!] - {label}: check failed (infra) — skipping reject: {reason[:120]}")
+                continue
             return f"{label} ban detected: {detail}"
-        # Unexpected error after retries — treat as ban per product rule
+        # Unexpected error after retries — only assume banned for join/kick text,
+        # not for checker tooling failures.
+        soft = str(reason or "").lower()
+        if any(
+            x in soft
+            for x in (
+                "syntaxerror",
+                "bad json",
+                "script missing",
+                "failed to start",
+                "subprocess timed out",
+                "empty output",
+                "proxy connect failed",
+                "coldproxy",
+                "socketclosed",
+                "transient",
+            )
+        ):
+            logger.error(
+                "ban check %s soft error — NOT rejecting: %s",
+                key,
+                reason,
+            )
+            print(f"[!] - {label}: check error — skipping reject: {reason[:120]}")
+            continue
         return f"{label} join failed after retries (assumed banned): {reason}"
 
     return None

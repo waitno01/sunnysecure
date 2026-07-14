@@ -27,17 +27,45 @@ function stripColors(s) {
 }
 
 function formatKick(reason) {
-  if (typeof reason === 'string') return stripColors(reason);
+  if (typeof reason === 'string') {
+    // Mineflayer sometimes stringifies NBT compounds
+    if (reason.includes('"type":"compound"') || reason.includes('"Ban ID"')) {
+      try {
+        const texts = [...reason.matchAll(/"text"\s*:\s*\{\s*"type"\s*:\s*"string"\s*,\s*"value"\s*:\s*"((?:\\.|[^"\\])*)"/g)]
+          .map((m) => m[1].replace(/\\n/g, '\n').replace(/\\"/g, '"'));
+        if (texts.length) return stripColors(texts.join(''));
+      } catch (_) {}
+    }
+    return stripColors(reason);
+  }
   if (reason && typeof reason === 'object') {
     if (typeof reason.translate === 'string') {
-      const with = reason.with || reason['with'] || [];
-      const extras = Array.isArray(with)
-        ? with.map((x) => (typeof x === 'string' ? x : x?.text || '')).join(' ')
+      const withArgs = reason.with || reason['with'] || [];
+      const extras = Array.isArray(withArgs)
+        ? withArgs.map((x) => (typeof x === 'string' ? x : x?.text || '')).join(' ')
         : '';
       return stripColors(`${reason.translate} ${extras}`);
     }
     if (typeof reason.text === 'string' && reason.text) return stripColors(reason.text);
+    // Walk chat components / NBT-ish objects for nested text
     try {
+      const parts = [];
+      const walk = (node) => {
+        if (!node) return;
+        if (typeof node === 'string') {
+          parts.push(node);
+          return;
+        }
+        if (typeof node !== 'object') return;
+        if (typeof node.text === 'string') parts.push(node.text);
+        if (typeof node.value === 'string') parts.push(node.value);
+        if (Array.isArray(node.extra)) node.extra.forEach(walk);
+        if (node.extra && typeof node.extra === 'object' && node.extra.value) walk(node.extra.value);
+        if (Array.isArray(node.value)) node.value.forEach(walk);
+        if (node.value && typeof node.value === 'object' && !Array.isArray(node.value)) walk(node.value);
+      };
+      walk(reason);
+      if (parts.length) return stripColors(parts.join(''));
       return stripColors(JSON.stringify(reason));
     } catch (_) {
       return stripColors(String(reason));
@@ -69,31 +97,35 @@ function isBanMessage(text) {
 }
 
 function isTransientKick(text) {
-  const lower = String(text || '').toLowerCase();
+  const lower = String(text || '').toLowerCase().replace(/\s+/g, '');
   if (isBanMessage(text)) return false;
+  const raw = String(text || '').toLowerCase();
   return (
-    lower.includes('timed out') ||
-    lower.includes('timeout') ||
-    lower.includes('connection reset') ||
-    lower.includes('connection refused') ||
-    lower.includes('failed to verify') ||
-    lower.includes('failed to authenticate') ||
-    lower.includes('authentication') ||
-    lower.includes('proxy') ||
-    lower.includes('throttl') ||
-    lower.includes('rate limit') ||
-    lower.includes('try again') ||
-    lower.includes('server is full') ||
-    lower.includes('restart') ||
-    lower.includes('offline') ||
-    lower.includes('econn') ||
-    lower.includes('socket') ||
-    lower.includes('internal exception') ||
-    lower.includes('io.netty') ||
-    lower.includes('read timed') ||
-    lower.includes('closed') ||
-    lower.includes('encrypted') ||
-    lower.includes('invalid session')
+    lower === 'socketclosed' ||
+    lower.includes('socketclosed') ||
+    raw.includes('timed out') ||
+    raw.includes('timeout') ||
+    raw.includes('connection reset') ||
+    raw.includes('connection refused') ||
+    raw.includes('failed to verify') ||
+    raw.includes('failed to authenticate') ||
+    raw.includes('authentication') ||
+    raw.includes('proxy') ||
+    raw.includes('throttl') ||
+    raw.includes('rate limit') ||
+    raw.includes('try again') ||
+    raw.includes('server is full') ||
+    raw.includes('restart') ||
+    raw.includes('offline') ||
+    raw.includes('econn') ||
+    raw.includes('socket') ||
+    raw.includes('internal exception') ||
+    raw.includes('io.netty') ||
+    raw.includes('read timed') ||
+    raw.includes('closed') ||
+    raw.includes('encrypted') ||
+    raw.includes('invalid session') ||
+    raw.includes('disconnected')
   );
 }
 
@@ -232,6 +264,30 @@ function attemptConnect({ host, port, token, name, uuid, proxy, timeoutMs }) {
       return;
     }
 
+    // Capture disconnect/kick packets BEFORE mineflayer collapses them to "socketClosed"
+    let lastDisconnectReason = null;
+    const rememberDisconnect = (packet) => {
+      try {
+        const reason = packet?.reason ?? packet;
+        const text = formatKick(reason);
+        if (text && text.toLowerCase() !== 'socketclosed') {
+          lastDisconnectReason = reason;
+        }
+      } catch (_) {}
+    };
+    const client = bot._client;
+    if (client) {
+      client.on('kick_disconnect', rememberDisconnect);
+      client.on('disconnect', rememberDisconnect);
+      // Some versions emit raw packet names differently
+      client.on('packet', (data, meta) => {
+        if (!meta || !meta.name) return;
+        if (meta.name === 'kick_disconnect' || meta.name === 'disconnect') {
+          rememberDisconnect(data);
+        }
+      });
+    }
+
     bot.once('spawn', () => {
       done({ status: 'ok', reason: 'spawned' });
     });
@@ -243,6 +299,7 @@ function attemptConnect({ host, port, token, name, uuid, proxy, timeoutMs }) {
     });
 
     bot.on('kicked', (reason) => {
+      lastDisconnectReason = reason;
       const text = formatKick(reason);
       const banId = extractBanId(text);
       if (isBanMessage(text)) {
@@ -253,17 +310,21 @@ function attemptConnect({ host, port, token, name, uuid, proxy, timeoutMs }) {
     });
 
     bot.on('end', (reason) => {
-      if (settled) return;
-      const text = formatKick(reason);
-      if (isBanMessage(text)) {
-        done({
-          status: 'banned',
-          reason: text || 'disconnected (ban)',
-          ban_id: extractBanId(text),
-        });
-      } else {
-        done({ status: 'error', reason: text || 'disconnected' });
-      }
+      // Brief delay so 'kicked' / kick_disconnect can win the race over socketClosed
+      setTimeout(() => {
+        if (settled) return;
+        const prefer = lastDisconnectReason != null ? lastDisconnectReason : reason;
+        const text = formatKick(prefer);
+        if (isBanMessage(text)) {
+          done({
+            status: 'banned',
+            reason: text || 'disconnected (ban)',
+            ban_id: extractBanId(text),
+          });
+        } else {
+          done({ status: 'error', reason: text || 'disconnected' });
+        }
+      }, 150);
     });
 
     bot.on('error', (err) => {
@@ -327,16 +388,38 @@ async function main() {
     break;
   }
 
-  // After max retries: assume banned and surface kick/error reason
-  last = {
-    status: 'banned',
-    reason: `Assumed banned after ${last?.attempts || maxAttempts} failed joins: ${last?.reason || 'unknown'}`,
-    ban_id: extractBanId(last?.reason),
-    attempts: last?.attempts || maxAttempts,
-    name,
-    uuid,
-    assumed: true,
-  };
+  // After max retries: only assume banned when we saw ban-like text.
+  // Bare socketClosed / proxy drops stay as soft errors (do not reject sells).
+  const finalReason = last?.reason || 'unknown';
+  if (isBanMessage(finalReason)) {
+    last = {
+      status: 'banned',
+      reason: finalReason,
+      ban_id: extractBanId(finalReason),
+      attempts: last?.attempts || maxAttempts,
+      name,
+      uuid,
+    };
+  } else if (isTransientKick(finalReason)) {
+    last = {
+      status: 'error',
+      reason: `Join failed after ${last?.attempts || maxAttempts} attempts (transient): ${finalReason}`,
+      attempts: last?.attempts || maxAttempts,
+      name,
+      uuid,
+      assumed: false,
+    };
+  } else {
+    last = {
+      status: 'banned',
+      reason: `Assumed banned after ${last?.attempts || maxAttempts} failed joins: ${finalReason}`,
+      ban_id: extractBanId(finalReason),
+      attempts: last?.attempts || maxAttempts,
+      name,
+      uuid,
+      assumed: true,
+    };
+  }
   console.log(JSON.stringify(last));
   process.exit(0);
 }

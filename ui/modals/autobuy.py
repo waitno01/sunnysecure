@@ -17,6 +17,44 @@ def _autobuy_cfg() -> dict:
         return json.load(f).get("autobuy") or {}
 
 
+async def _grant_seller_role(interaction: discord.Interaction) -> None:
+    """Assign the configured seller role after a successful MFA sell."""
+    role_raw = _autobuy_cfg().get("seller_role_id")
+    if not role_raw:
+        return
+    try:
+        role_id = int(role_raw)
+    except (TypeError, ValueError):
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        return
+
+    member = interaction.user
+    if not isinstance(member, discord.Member):
+        try:
+            member = await guild.fetch_member(interaction.user.id)
+        except discord.HTTPException:
+            return
+
+    if any(r.id == role_id for r in member.roles):
+        return
+
+    role = guild.get_role(role_id)
+    if role is None:
+        return
+
+    try:
+        await member.add_roles(role, reason="Successful MFA sell")
+    except discord.HTTPException:
+        logger.exception(
+            "Failed to grant seller role %s to %s",
+            role_id,
+            interaction.user.id,
+        )
+
+
 async def _send_seller_success_dm(
     user: discord.abc.User,
     *,
@@ -89,18 +127,33 @@ async def _send_seller_success_dm(
 
 
 class LinkLtcModal(ui.Modal):
-    def __init__(self):
-        super().__init__(title="Link LTC Address")
+    def __init__(self, current_address: str | None = None):
+        self.current_address = (current_address or "").strip() or None
+        title = "Update LTC Address" if self.current_address else "Link LTC Address"
+        super().__init__(title=title)
+        placeholder = "L... / M... / ltc1... (replaces your current address)"
+        if self.current_address:
+            shown = self.current_address
+            if len(shown) > 28:
+                shown = f"{shown[:12]}…{shown[-8:]}"
+            placeholder = f"Current: {shown} — paste new address to replace"
         self.add_item(ui.InputText(
             label="Your Litecoin (LTC) address",
             style=discord.InputTextStyle.short,
-            placeholder="Example: LTc1q... or LPvqR... (starts with L, M, or ltc1)",
+            placeholder=placeholder[:100],
             required=True,
             max_length=100,
         ))
 
     async def callback(self, interaction: discord.Interaction):
-        address = (self.children[0].value or "").strip()
+        # Normalize: strip whitespace / zero-width chars that break validation
+        raw = self.children[0].value or ""
+        address = "".join(raw.split())
+        address = address.replace("\u200b", "").replace("\ufeff", "").strip()
+        # Bech32 is case-insensitive — store lowercase for ltc1
+        if address.lower().startswith("ltc1"):
+            address = address.lower()
+
         if not is_valid_ltc_address(address):
             await interaction.response.send_message(
                 "Invalid Litecoin address. Use a mainnet address starting with `L`, `M`, or `ltc1`.",
@@ -109,13 +162,40 @@ class LinkLtcModal(ui.Modal):
             return
 
         with DBConnection() as db:
+            previous = db.autobuy_get_ltc(interaction.user.id)
             db.autobuy_set_ltc(interaction.user.id, address)
+            # Read back to confirm persist
+            saved = db.autobuy_get_ltc(interaction.user.id)
 
-        embed = discord.Embed(
-            title="LTC Linked",
-            description=f"Payouts will be sent to:\n```{address}```",
-            color=0x57F287,
-        )
+        if saved != address:
+            await interaction.response.send_message(
+                "Failed to save LTC address — please try again.",
+                ephemeral=True,
+            )
+            return
+
+        if previous and previous != address:
+            embed = discord.Embed(
+                title="LTC Address Updated",
+                description=(
+                    f"**Previous:**\n```{previous}```\n"
+                    f"**New (active):**\n```{address}```\n"
+                    "Future withdrawals will use the new address."
+                ),
+                color=0x57F287,
+            )
+        elif previous and previous == address:
+            embed = discord.Embed(
+                title="LTC Already Linked",
+                description=f"Same address kept:\n```{address}```",
+                color=0x57F287,
+            )
+        else:
+            embed = discord.Embed(
+                title="LTC Linked",
+                description=f"Payouts will be sent to:\n```{address}```",
+                color=0x57F287,
+            )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -487,6 +567,7 @@ class SellMfaModal(ui.Modal):
             await interaction.followup.send(embed=summary, ephemeral=True)
 
         if hits > 0:
+            await _grant_seller_role(interaction)
             await _send_seller_success_dm(
                 interaction.user,
                 hits=hits,

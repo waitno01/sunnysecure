@@ -527,6 +527,60 @@ class DBConnection:
         """, (discord_id,)).fetchone()
         return int(row[0] or 0)
 
+    def autobuy_seller_stats(self, discord_id: int) -> dict:
+        """Lifetime MFA sold + $ credited for a seller."""
+        sold = self.cursor.execute("""
+            SELECT COUNT(*) FROM autobuy_sells
+            WHERE discord_id = ? AND success = 1
+        """, (discord_id,)).fetchone()[0]
+        failed = self.cursor.execute("""
+            SELECT COUNT(*) FROM autobuy_sells
+            WHERE discord_id = ? AND success = 0
+        """, (discord_id,)).fetchone()[0]
+        # Total paid = sum of credit amounts for successful sells (incl. later voided)
+        paid = self.cursor.execute("""
+            SELECT COALESCE(SUM(c.amount_usd), 0)
+            FROM autobuy_sells s
+            LEFT JOIN autobuy_credits c ON c.id = s.credit_id
+            WHERE s.discord_id = ? AND s.success = 1
+        """, (discord_id,)).fetchone()[0]
+        withdrawn = self.cursor.execute("""
+            SELECT COALESCE(SUM(amount_usd), 0) FROM autobuy_withdrawals
+            WHERE discord_id = ? AND status = 'sent'
+        """, (discord_id,)).fetchone()[0]
+        bals = self.autobuy_balances(discord_id)
+        return {
+            "mfa_sold": int(sold or 0),
+            "mfa_failed": int(failed or 0),
+            "total_paid_usd": float(paid or 0),
+            "withdrawn_usd": float(withdrawn or 0),
+            **bals,
+        }
+
+    def autobuy_leaderboard(self, limit: int = 10) -> list[dict]:
+        """Top sellers by MFA sold (successful)."""
+        limit = max(1, min(int(limit or 10), 25))
+        rows = self.cursor.execute("""
+            SELECT
+                s.discord_id,
+                COUNT(*) AS mfa_sold,
+                COALESCE(SUM(c.amount_usd), 0) AS total_paid_usd
+            FROM autobuy_sells s
+            LEFT JOIN autobuy_credits c ON c.id = s.credit_id
+            WHERE s.success = 1
+            GROUP BY s.discord_id
+            ORDER BY mfa_sold DESC, total_paid_usd DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        return [
+            {
+                "discord_id": int(r[0]),
+                "mfa_sold": int(r[1] or 0),
+                "total_paid_usd": float(r[2] or 0),
+            }
+            for r in rows
+        ]
+
     def autobuy_balances(self, discord_id: int) -> dict:
         # pending = still in hold / awaiting periodic account checks
         pending = self.cursor.execute("""
