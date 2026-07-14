@@ -1,0 +1,38 @@
+{
+  "name": "yggdrasil",
+  "version": "1.8.0",
+  "author": "Zeke Sonxx <zeke@zekesonxx.com>",
+  "description": "Mojang authentication (Yggdrasil) client",
+  "scripts": {
+    "test": "mocha -R spec",
+    "pretest": "npm run lint",
+    "lint": "standard",
+    "fix": "standard --fix"
+  },
+  "main": "./src/index.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PrismarineJS/node-yggdrasil.git"
+  },
+  "bugs": {
+    "url": "https://github.com/PrismarineJS/node-yggdrasil/issues"
+  },
+  "keywords": [
+    "minecraft",
+    "yggdrasil",
+    "authentication"
+  ],
+  "dependencies": {
+    "node-fetch": "^2.6.1",
+    "uuid": "^10.0.0"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.8.0",
+    "@types/node-fetch": "^3.0.3",
+    "@types/uuid": "^10.0.0",
+    "mocha": "^10.0.0",
+    "nock": "^13.0.2",
+    "standard": "^17.0.0"
+  }
+}

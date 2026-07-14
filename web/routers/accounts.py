@@ -21,6 +21,14 @@ def accounts(user: str = Depends(require_auth)):
     with DBConnection() as db:
         return db.get_all_secured_accounts()
 
+
+@router.get("/api/accounts/autobuy")
+def autobuy_accounts(user: str = Depends(require_auth)):
+    """Accounts sold through the Discord autobuy panel."""
+    with DBConnection() as db:
+        return db.get_autobuy_secured_accounts()
+
+
 @router.get("/api/accounts/{account_id}")
 def account_detail(account_id: str, user: str = Depends(require_auth)):
     with DBConnection() as db:

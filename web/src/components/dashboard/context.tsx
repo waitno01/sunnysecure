@@ -3,7 +3,7 @@ import { getAuthToken } from "@/lib/auth";
 
 export type Notification = { id: number; title: string; description?: string; time: number };
 
-export type Tab = "overview" | "accounts" | "secure" | "emails" | "bot" | "settings";
+export type Tab = "overview" | "accounts" | "accounts-autobuy" | "secure" | "emails" | "bot" | "settings";
 
 export const NotificationContext = createContext<{
   notifications: Notification[];

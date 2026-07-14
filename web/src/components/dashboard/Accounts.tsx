@@ -564,7 +564,7 @@ function GameStatsSection({ accountId, mcName }: { accountId: string; mcName?: s
   );
 }
 
-function AccountDetail({ account, onBack, onDeleted }: { account: Account; onBack: () => void; onDeleted: () => void }) {
+export function AccountDetail({ account, onBack, onDeleted }: { account: Account; onBack: () => void; onDeleted: () => void }) {
   const [detail, setDetail] = useState<Account>(account);
   const [emails, setEmails] = useState<EmailEntry[]>([]);
   const [showMail, setShowMail] = useState(false);

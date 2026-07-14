@@ -56,7 +56,8 @@ async def _send_seller_success_dm(
     embed.add_field(
         name="Payout Unlock",
         value=(
-            f"Credits unlock <t:{unlock_ts}:R>\n"
+            f"Credits unlock <t:{unlock_ts}:R> after hold **and** "
+            f"passing lock/pullback checks.\n"
             f"<t:{unlock_ts}:F>\n"
             f"_Each credit has its own {pending_hours}h timer._"
         ),
@@ -202,16 +203,47 @@ class WithdrawModal(ui.Modal):
                     wid, status="sent", txid=txid, amount_ltc=amount_ltc
                 )
 
+            from payments.ltc_wallet import blockcypher_tx_url
+
+            explorer = blockcypher_tx_url(txid)
             embed = discord.Embed(
                 title="Withdrawal Sent",
                 description=(
                     f"**${amount:.2f}** → **{amount_ltc:.8f} LTC**\n"
-                    f"Address: `{ltc}`\n"
-                    f"TX: `{txid}`"
+                    f"**To:** `{ltc}`\n"
+                    f"**TXID:** `{txid}`\n"
+                    f"[View on BlockCypher]({explorer})"
                 ),
                 color=0x57F287,
             )
             await interaction.followup.send(embed=embed, ephemeral=True)
+
+            # Also DM the seller a receipt
+            try:
+                dm = discord.Embed(
+                    title="Withdrawal successful",
+                    description=(
+                        f"Your payout was sent.\n\n"
+                        f"**Amount:** ${amount:.2f} ({amount_ltc:.8f} LTC)\n"
+                        f"**Address:** `{ltc}`\n"
+                        f"**TXID:** `{txid}`\n"
+                        f"[BlockCypher]({explorer})"
+                    ),
+                    color=0x57F287,
+                )
+                await interaction.user.send(embed=dm)
+            except discord.HTTPException:
+                logger.warning(
+                    "Could not DM withdraw receipt to %s", interaction.user.id
+                )
+
+            # Hot wallet balance dropped — refresh all selling panels
+            try:
+                from ui.buttons.autobuy import refresh_autobuy_panels
+
+                await refresh_autobuy_panels(interaction.client, force=True)
+            except Exception:
+                logger.exception("Failed to refresh autobuy panels after withdraw")
         except Exception as exc:
             logger.exception("autobuy withdraw failed for %s", interaction.user.id)
             # refund credits
@@ -347,10 +379,21 @@ class SellMfaModal(ui.Modal):
                 with DBConnection() as db:
                     db.autobuy_record_sell(interaction.user.id, email, False)
 
-                # DM seller new credentials + error when recovery already changed them
+                # Always DM seller new credentials when recover already changed them
                 fail_embed = None
                 if isinstance(account, dict):
                     fail_embed = account.get("hit_embed")
+                    if fail_embed is None and account.get("credentials_changed"):
+                        from securing.build_embeds import build_failure_embed
+
+                        ms = account.get("microsoft") or {}
+                        fail_embed = build_failure_embed(
+                            email,
+                            ms,
+                            reason,
+                            error=account.get("error") or reason,
+                            credentials_changed=True,
+                        )
                 if fail_embed is not None:
                     try:
                         await interaction.user.send(embed=fail_embed)
@@ -371,6 +414,10 @@ class SellMfaModal(ui.Modal):
             unlock_dt = datetime.now(timezone.utc) + timedelta(hours=pending_hours)
             available_at = unlock_dt.strftime("%Y-%m-%d %H:%M:%S")
             unlock_ts = int(unlock_dt.timestamp())
+            check_hours = float(cfg.get("hold_check_interval_hours") or 6)
+            next_check = (
+                datetime.now(timezone.utc) + timedelta(hours=min(check_hours, pending_hours))
+            ).strftime("%Y-%m-%d %H:%M:%S")
 
             with DBConnection() as db:
                 credit_id = db.autobuy_add_credit(
@@ -379,8 +426,15 @@ class SellMfaModal(ui.Modal):
                     available_at,
                     "sell_mfa",
                     email,
+                    next_check_at=next_check,
                 )
-                db.autobuy_record_sell(interaction.user.id, email, True, credit_id)
+                db.autobuy_record_sell(
+                    interaction.user.id,
+                    email,
+                    True,
+                    credit_id,
+                    account_id=account.get("account_id"),
+                )
 
             hits += 1
             earned += price

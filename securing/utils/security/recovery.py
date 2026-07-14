@@ -26,14 +26,21 @@ class RecoverError(Exception):
         self.credentials_changed = credentials_changed
 
 
-async def verify_password_works(session: httpx.AsyncClient, email: str, password: str) -> str:
+async def verify_password_works(
+    session: httpx.AsyncClient,
+    email: str,
+    password: str,
+    *,
+    settle_delay: float = 4.0,
+) -> str:
     """Check whether Microsoft accepted the new password.
 
     Returns: "ok" | "bad" | "unknown"
     """
     try:
         # RecoverUser password propagation is often delayed under load.
-        await asyncio.sleep(4.0)
+        if settle_delay > 0:
+            await asyncio.sleep(settle_delay)
         dedupe_cookies(session)
 
         live = await livedata(session)

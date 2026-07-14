@@ -115,9 +115,16 @@ def set_bot_status(body: BotStatusRequest, user: str = Depends(require_auth)):
 def set_autosecure(body: AutosecureRequest, user: str = Depends(require_auth)):
     config = get_config()["main"]
 
-    config.setdefault("autosecure", {})["replace_main_alias"] = body.replace_main_alias
-    config["autosecure"]["enable_2fa"] = body.enable_2fa
-    config["autosecure"]["minecon_mode"] = body.minecon_mode
+    auto = config.setdefault("autosecure", {})
+    auto["replace_main_alias"] = body.replace_main_alias
+    auto["enable_2fa"] = body.enable_2fa
+    auto["minecon_mode"] = body.minecon_mode
+
+    reject = auto.setdefault("reject", {})
+    if body.check_hypixel_ban is not None:
+        reject["check_hypixel_ban"] = bool(body.check_hypixel_ban)
+    if body.check_donutsmp_ban is not None:
+        reject["check_donutsmp_ban"] = bool(body.check_donutsmp_ban)
 
     with open("config/config.json", "w") as f:
         json.dump(config, f, indent=2)

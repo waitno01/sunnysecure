@@ -1,0 +1,16 @@
+{
+  "name": "ban_check",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "mineflayer": "^4.37.1",
+    "socks": "^2.8.9"
+  }
+}

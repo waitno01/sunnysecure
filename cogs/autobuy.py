@@ -1,17 +1,99 @@
-from discord.ext import commands
+from discord.ext import commands, tasks
 import discord
 import json
+import logging
 
-from ui.buttons.autobuy import AutobuyView, build_autobuy_embed
+from ui.buttons.autobuy import AutobuyView, build_autobuy_embed, refresh_autobuy_panels
 from payments.ltc_wallet import get_ltc_wallet
+from database.database import DBConnection
+from securing.autobuy_hold_check import process_due_hold_checks
 
 bot_config = json.load(open("config/bot.json", "r"))
 name = bot_config["enabled_commands"]["aliases"]["autobuy"]
+logger = logging.getLogger("bot")
+
+
+def _autobuy_cfg() -> dict:
+    with open("config/config.json", "r") as f:
+        return json.load(f).get("autobuy") or {}
 
 
 class Autobuy(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self._balance_watch.start()
+        self._hold_check.start()
+
+    def cog_unload(self):
+        self._balance_watch.cancel()
+        self._hold_check.cancel()
+
+    @tasks.loop(seconds=15)
+    async def _balance_watch(self):
+        """Poll explorer/hot wallet and rewrite panel embeds when LTC balance changes."""
+        try:
+            await refresh_autobuy_panels(self.bot)
+        except Exception:
+            logger.exception("autobuy balance watch failed")
+
+    @_balance_watch.before_loop
+    async def _before_balance_watch(self):
+        await self.bot.wait_until_ready()
+
+    @tasks.loop(minutes=15)
+    async def _hold_check(self):
+        """Every 15m: run due lock/pullback checks on holding autobuy credits."""
+        cfg = _autobuy_cfg()
+        if cfg.get("hold_check_enabled", True) is False:
+            return
+        interval = float(cfg.get("hold_check_interval_hours") or 6)
+        try:
+            result = await process_due_hold_checks(interval_hours=interval, limit=20)
+        except Exception:
+            logger.exception("autobuy hold check loop failed")
+            return
+
+        stats = result.get("stats") or {}
+        if stats.get("checked") or stats.get("voided") or stats.get("cleared"):
+            logger.info(
+                "autobuy hold check: checked=%s cleared=%s voided=%s rescheduled=%s skipped=%s",
+                stats.get("checked", 0),
+                stats.get("cleared", 0),
+                stats.get("voided", 0),
+                stats.get("rescheduled", 0),
+                stats.get("skipped", 0),
+            )
+
+        for ev in result.get("void_events") or []:
+            await self._dm_void(ev)
+
+    @_hold_check.before_loop
+    async def _before_hold_check(self):
+        await self.bot.wait_until_ready()
+
+    async def _dm_void(self, ev: dict) -> None:
+        try:
+            user = self.bot.get_user(ev["discord_id"])
+            if user is None:
+                user = await self.bot.fetch_user(ev["discord_id"])
+            embed = discord.Embed(
+                title="Credit voided — account failed hold check",
+                description=(
+                    f"Account `{ev.get('email')}` failed a post-sale security check.\n"
+                    f"**Amount removed:** ${float(ev.get('amount_usd') or 0):.2f}\n"
+                    f"**Reason:** {ev.get('reason') or 'unknown'}\n\n"
+                    "Credits only become withdrawable after the hold period **and** "
+                    "passing periodic lock/credential checks."
+                ),
+                color=0xE74C3C,
+            )
+            await user.send(embed=embed)
+        except Exception:
+            logger.exception(
+                "Failed to DM void notice to %s for %s",
+                ev.get("discord_id"),
+                ev.get("email"),
+            )
 
     @discord.slash_command(name=name, description="Post the account selling (autobuy) panel")
     async def autobuy(self, ctx: discord.ApplicationContext):
@@ -22,7 +104,6 @@ class Autobuy(commands.Cog):
             )
             return
 
-        # Ensure hot wallet exists so owner can fund it
         try:
             wallet = get_ltc_wallet()
             wallet_note = f"Hot wallet deposit address:\n```{wallet.address}```"
@@ -30,15 +111,16 @@ class Autobuy(commands.Cog):
             wallet_note = f"Wallet init warning: `{exc}`"
 
         await ctx.defer(ephemeral=True)
-        await ctx.channel.send(
-            embed=build_autobuy_embed(),
-            view=AutobuyView(),
-        )
+        embed = build_autobuy_embed()
+        view = AutobuyView()
+        msg = await ctx.channel.send(embed=embed, view=view)
+        with DBConnection() as db:
+            db.autobuy_upsert_panel(msg.id, msg.channel.id, getattr(ctx.guild, "id", None))
         await ctx.followup.send(
-            f"Autobuy panel sent.\n{wallet_note}",
+            f"Autobuy panel posted.\n{wallet_note}",
             ephemeral=True,
         )
 
 
-def setup(bot: commands.Bot) -> None:
+def setup(bot):
     bot.add_cog(Autobuy(bot))

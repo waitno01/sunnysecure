@@ -1,0 +1,89 @@
+{
+	"name": "@xboxreplay/xboxlive-auth",
+	"description": "A lightweight, zero-dependency Xbox Network (Xbox Live) authentication library for Node.js with OAuth 2.0 support.",
+	"version": "5.1.0",
+	"keywords": [
+		"xboxnetwork",
+		"xboxreplay",
+		"xboxlive",
+		"xbox",
+		"live",
+		"auth"
+	],
+	"license": "Apache-2.0",
+	"author": {
+		"name": "Alexis Bize",
+		"email": "alexis.bize@gmail.com"
+	},
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/XboxReplay/xboxlive-auth"
+	},
+	"bugs": {
+		"url": "https://github.com/XboxReplay/xboxlive-auth/issues"
+	},
+	"homepage": "https://github.com/XboxReplay/xboxlive-auth#readme",
+	"type": "commonjs",
+	"main": "./dist/index.js",
+	"module": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js",
+			"require": "./dist/index.js"
+		}
+	},
+	"files": [
+		"./dist/**/*",
+		"./LICENSE",
+		"./README.md"
+	],
+	"sideEffects": false,
+	"scripts": {
+		"build": "npm run clean && tsc",
+		"clean": "rimraf ./dist",
+		"prepublishOnly": "npm run test && npm run build",
+		"test:integration": "jest --runInBand ./tests/integration",
+		"test:e2e": "touch .env.test && dotenv -e .env.test -- jest --runInBand ./tests/e2e",
+		"test": "npm run test:integration && npm run test:e2e",
+		"typecheck": "tsc --noEmit"
+	},
+	"devDependencies": {
+		"@types/jest": "30.0.0",
+		"@types/node": "24.0.3",
+		"dotenv-cli": "8.0.0",
+		"jest": "30.0.0",
+		"rimraf": "6.0.1",
+		"ts-jest": "29.4.0",
+		"typescript": "5.8.3"
+	},
+	"engines": {
+		"node": ">=16.0.0"
+	},
+	"jest": {
+		"preset": "ts-jest/presets/default-esm",
+		"testEnvironment": "node",
+		"moduleFileExtensions": [
+			"ts",
+			"js"
+		],
+		"testMatch": [
+			"**/?(*.)+(spec|test).ts"
+		],
+		"transform": {
+			"^.+\\.ts$": [
+				"ts-jest",
+				{
+					"useESM": true
+				}
+			]
+		},
+		"moduleNameMapper": {
+			"^src/(.*)$": "<rootDir>/src/$1"
+		},
+		"extensionsToTreatAsEsm": [
+			".ts"
+		]
+	}
+}
