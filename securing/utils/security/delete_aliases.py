@@ -21,9 +21,15 @@ def _extract_canary(html: str) -> str | None:
     return None
 
 
-async def delete_aliases(session: httpx.AsyncClient) -> None:
+async def delete_aliases(
+    session: httpx.AsyncClient,
+    *,
+    keep_email: str | None = None,
+) -> None:
     """Remove secondary aliases. Soft-skips if the manage page has no canary
     (common when Microsoft returns an interrupt / i5600 / SSO page instead).
+
+    ``keep_email`` — never remove this address (new primary / current login).
     """
     response = await session.get(
         url="https://account.live.com/names/manage",
@@ -54,8 +60,18 @@ async def delete_aliases(session: httpx.AsyncClient) -> None:
         print("[~] - No aliases to remove")
         return
 
+    keep = (keep_email or "").strip().lower()
+    keep_local = keep.split("@", 1)[0] if keep else ""
+
     print(f"[~] - Found Aliases ({aliases})")
     for alias in aliases:
+        alias_l = alias.strip().lower()
+        local = alias_l.split("@", 1)[0]
+        # Never delete the kept primary (or its local-part match)
+        if keep and (alias_l == keep or (keep_local and local == keep_local)):
+            print(f"[~] - Keeping primary alias ({alias})")
+            continue
+        # Also never delete the first listed alias when it matches keep — belt & suspenders
         await session.post(
             url="https://account.live.com/names/Manage",
             headers={

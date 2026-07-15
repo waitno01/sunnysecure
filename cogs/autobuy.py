@@ -39,6 +39,10 @@ class Autobuy(commands.Cog):
     @_balance_watch.before_loop
     async def _before_balance_watch(self):
         await self.bot.wait_until_ready()
+        try:
+            await refresh_autobuy_panels(self.bot, force=True)
+        except Exception:
+            logger.exception("autobuy initial panel refresh failed")
 
     @tasks.loop(minutes=15)
     async def _hold_check(self):

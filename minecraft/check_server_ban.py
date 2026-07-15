@@ -146,8 +146,7 @@ async def check_server_ban(
         return {"status": "error", "reason": f"unknown server {server_key}"}
 
     cfg = _load_cfg()
-    proxy = _coldproxy_line(cfg)
-    if not proxy:
+    if not _coldproxy_line(cfg):
         logger.warning("coldproxy not configured — ban check for %s without proxy", server_key)
 
     if not name or not uuid:
@@ -156,20 +155,65 @@ async def check_server_ban(
             name = name or profile["name"]
             uuid = uuid or profile["uuid"]
 
-    result = await asyncio.to_thread(
-        _run_check_sync,
-        host=meta["host"],
-        port=int(meta["port"]),
-        token=ssid,
-        name=name,
-        uuid=uuid,
-        proxy=proxy,
-        attempts=3,
-        timeout_ms=45000,
-    )
-    result["server"] = server_key
-    result["label"] = meta["label"]
-    return result
+    # One Node attempt per Python loop so each retry gets a fresh ColdProxy SSID/IP
+    max_attempts = 3
+    last: dict = {"status": "error", "reason": "no attempts run", "attempts": 0}
+    for attempt in range(1, max_attempts + 1):
+        proxy = _coldproxy_line(cfg)  # new {ssid} / gateway port each try
+        logger.info(
+            "ban check %s attempt=%s/%s proxy=%s",
+            server_key,
+            attempt,
+            max_attempts,
+            (proxy.split(":")[1] if proxy else "none"),
+        )
+        result = await asyncio.to_thread(
+            _run_check_sync,
+            host=meta["host"],
+            port=int(meta["port"]),
+            token=ssid,
+            name=name,
+            uuid=uuid,
+            proxy=proxy,
+            attempts=1,
+            timeout_ms=45000,
+        )
+        result["attempts"] = attempt
+        result["server"] = server_key
+        result["label"] = meta["label"]
+        last = result
+
+        status = result.get("status")
+        if status in ("ok", "banned"):
+            return result
+
+        reason = str(result.get("reason") or "").lower()
+        # Rotate IP and retry on transient / already-online kicks
+        if attempt < max_attempts and any(
+            x in reason
+            for x in (
+                "already online",
+                "already connected",
+                "request-join-cache",
+                "socketclosed",
+                "proxy",
+                "timed out",
+                "timeout",
+                "transient",
+                "throttl",
+                "try again",
+            )
+        ):
+            await asyncio.sleep(1.5 * attempt)
+            continue
+        if attempt < max_attempts:
+            await asyncio.sleep(1.5 * attempt)
+            continue
+        break
+
+    last["server"] = server_key
+    last["label"] = meta["label"]
+    return last
 
 
 def _ssid_from_account(account: dict) -> str | None:
@@ -269,6 +313,9 @@ async def apply_ban_checks(account: dict) -> str | None:
                 "coldproxy",
                 "socketclosed",
                 "transient",
+                "already online",
+                "already connected",
+                "request-join-cache",
             )
         ):
             logger.error(

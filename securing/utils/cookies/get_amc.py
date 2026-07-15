@@ -37,6 +37,9 @@ async def scrape_token(session: httpx.AsyncClient, url: str) -> str | None:
 
 async def get_amc(session: httpx.AsyncClient) -> dict:
     # Gets AMCSecAuthJWT and scrapes RequestVerificationTokens per page.
+    from securing.utils.cookies.ensure_amc_jwt import ensure_amc_jwt
+
+    await ensure_amc_jwt(session)
 
     try:
         response = await session.get(
@@ -52,6 +55,13 @@ async def get_amc(session: httpx.AsyncClient) -> dict:
     home_token = await scrape_token(session, endpoints[0])
     profile_token = await scrape_token(session, endpoints[1])
     devices_token = await scrape_token(session, endpoints[2])
+
+    if not home_token or not profile_token:
+        # One more JWT bootstrap + retry scrape
+        await ensure_amc_jwt(session)
+        home_token = home_token or await scrape_token(session, endpoints[0])
+        profile_token = profile_token or await scrape_token(session, endpoints[1])
+        devices_token = devices_token or await scrape_token(session, endpoints[2])
 
     if not home_token or not profile_token:
         raise RuntimeError(

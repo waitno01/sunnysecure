@@ -10,6 +10,9 @@ _OTP_PATTERNS = (
     r"Security code:\s*(\d{6,8})",
     r"single-use code is:\s*(\d{6,8})",
     r"Your single-use code is:\s*(\d{6,8})",
+    # Dutch MS OTC: "De code voor eenmalig gebruik is: 354430"
+    r"code voor eenmalig gebruik is:\s*(\d{6,8})",
+    r"eenmalig gebruik is:\s*(\d{6,8})",
     r"verification code[:\s]+(\d{6,8})",
     r"code is:\s*(\d{6,8})",
     r"\b(\d{6,8})\b",
@@ -20,6 +23,11 @@ _SKIP_SUBJECT = (
     "unusual activity",
     "security notification",
     "new sign-in",
+    # Dutch equivalents
+    "ongewone aanmeldingsactiviteit",
+    "ongewone activiteit",
+    "beveiligingswaarschuwing",
+    "beveiligingsmelding",
 )
 
 

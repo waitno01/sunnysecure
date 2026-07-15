@@ -66,8 +66,11 @@ def lock_reason_from_check_api(info: dict | None) -> str | None:
     if status.get("isUnFamiliarLocationBlockSet"):
         return "Account is blocked due to unfamiliar location"
 
+    # isAccountCompromised is advisory — Microsoft still allows recovery /
+    # password login. Blocking here prevented securing accounts that sellers
+    # routinely recover with a valid recovery code.
     if status.get("isAccountCompromised"):
-        return "Account is flagged as compromised by Microsoft"
+        return None
 
     # isIssuePresent / isAccountInFailedLoginState are soft flags (often from
     # recent failed OTP attempts) — do not treat as locked.

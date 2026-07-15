@@ -122,6 +122,7 @@ class LinkLtcButton(discord.ui.Button):
     def __init__(self):
         super().__init__(
             label="Link LTC",
+            emoji="🔗",
             style=discord.ButtonStyle.primary,
             custom_id="persistent:autobuy_link_ltc",
         )
@@ -139,6 +140,7 @@ class WithdrawButton(discord.ui.Button):
     def __init__(self):
         super().__init__(
             label="Withdraw",
+            emoji="💸",
             style=discord.ButtonStyle.secondary,
             custom_id="persistent:autobuy_withdraw",
         )
@@ -174,6 +176,7 @@ class SellMfaButton(discord.ui.Button):
     def __init__(self):
         super().__init__(
             label="Sell MFA",
+            emoji="💰",
             style=discord.ButtonStyle.success,
             custom_id="persistent:autobuy_sell_mfa",
         )
@@ -224,7 +227,7 @@ def build_autobuy_embed(
         check_hours=check_h,
     )
 
-    ltc_usd_line = "LTC Balance: unavailable"
+    ltc_usd_line = "🏦 **Hot wallet:** unavailable"
     try:
         if snapshot is None and allow_network:
             from payments.ltc_wallet import get_ltc_wallet
@@ -237,16 +240,16 @@ def build_autobuy_embed(
             _last_snapshot = snapshot
             usd = float(snapshot.get("usd") or 0)
             ltc = float(snapshot.get("ltc") or 0)
-            ltc_usd_line = f"LTC Balance: **${usd:.2f}** ({ltc:.8f} LTC)"
+            ltc_usd_line = f"🏦 **Hot wallet:** **${usd:.2f}** · `{ltc:.8f}` LTC"
     except Exception:
         logger.exception("build_autobuy_embed balance failed")
 
-    description = f"{description}\n{ltc_usd_line}"
+    description = f"{description}\n\n{ltc_usd_line}"
 
     embed = discord.Embed(
-        title=emb.get("title") or "Account Selling Service",
+        title=emb.get("title") or "💰 Sell Your Accounts",
         description=description,
-        color=int(emb.get("color") or 0x2B2D31),
+        color=int(emb.get("color") or 0x57F287),
     )
-    embed.set_footer(text=emb.get("footer") or "Automated account selling service")
+    embed.set_footer(text=emb.get("footer") or "Fast · Secure · Paid in LTC")
     return embed

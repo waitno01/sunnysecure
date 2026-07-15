@@ -125,7 +125,11 @@ function isTransientKick(text) {
     raw.includes('closed') ||
     raw.includes('encrypted') ||
     raw.includes('invalid session') ||
-    raw.includes('disconnected')
+    raw.includes('disconnected') ||
+    raw.includes('already online') ||
+    raw.includes('already connected') ||
+    raw.includes('you are already') ||
+    raw.includes('request-join-cache')
   );
 }
 
