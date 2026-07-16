@@ -8,7 +8,7 @@ router = APIRouter()
 
 
 @router.post("/api/auth/login")
-@limiter.limit("30/minute")
+@limiter.limit("5/minute")
 async def login(request: Request, body: LoginRequest, response: Response):
     credentials = get_config()["main"]["web"]["credentials"]
     if body.username != credentials["username"] or not verify_password(body.password):

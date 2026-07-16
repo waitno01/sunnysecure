@@ -218,6 +218,9 @@ AGENTS.md
 config/config.json
 /config.json
 *.local.json
+!config/config.json.example
+!config/*.example.json
+!config/*.json.example
 
 # Env files (all variants)
 .env

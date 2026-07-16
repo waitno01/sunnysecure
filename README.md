@@ -67,9 +67,9 @@ Upstream Discord invite and original docs are not affiliated with this fork.
 git clone https://github.com/waitno01/autosecure.git
 cd autosecure
 
-# Create config (never commit this file)
-cp config/config.json.example config/config.json   # if example exists
-# otherwise create config/config.json — see Configuration below
+# Create config from the example (never commit your real config.json)
+cp config/config.json.example config/config.json
+# Edit config/config.json — set bot token, domain, web password, etc.
 
 # Python deps (3.12+)
 python3.12 -m venv .venv
@@ -117,9 +117,9 @@ Two config files control runtime behavior. **`config/config.json` is gitignored*
   },
   "web": {
     "credentials": {
-      "username": "admin",
-      "password": "CHANGE_ME",
-      "jwt_secret": "GENERATE_A_LONG_RANDOM_STRING"
+      "username": "dashboard_admin",
+      "password": "REPLACE_WITH_A_LONG_RANDOM_PASSWORD",
+      "jwt_secret": "REPLACE_WITH_64_HEX_CHARS_OR_LONG_RANDOM_STRING"
     }
   },
   "domain": "yourdomain.com",
@@ -216,7 +216,14 @@ Use Cloudflare Tunnel or nginx in front of ports 3000/8000. See upstream `cloudf
 
 ## Web dashboard
 
-Default: `http://YOUR_VPS_IP:3000` (or your tunnel/domain).
+Default: `http://YOUR_VPS_IP:3000` (Nitro binds `0.0.0.0:3000`; API stays on `127.0.0.1:8000` and is proxied).
+
+```bash
+cp config/config.json.example config/config.json
+# Set web.credentials.username / password / jwt_secret to values that are NOT the example placeholders
+```
+
+Login uses `web.credentials` in your local `config/config.json` (gitignored). **Enable 2FA** under Settings — the example password is a placeholder only and must be changed before going live.
 
 | Tab | Description |
 |-----|-------------|
@@ -226,8 +233,6 @@ Default: `http://YOUR_VPS_IP:3000` (or your tunnel/domain).
 | Emails | Security inboxes |
 | Bot Config | Channels, commands, embeds |
 | Settings | Dashboard password / 2FA |
-
-Login uses `web.credentials` from `config/config.json`.
 
 ---
 

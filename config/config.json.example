@@ -1,0 +1,79 @@
+{
+  "owners": [0],
+  "tokens": {
+    "bot_token": "YOUR_DISCORD_BOT_TOKEN",
+    "skytools_key": "",
+    "donut_key": ""
+  },
+  "discord": {
+    "logs_channel": "",
+    "accounts_channel": "",
+    "censored_logs_channel": ""
+  },
+  "autosecure": {
+    "replace_main_alias": true,
+    "enable_2fa": false,
+    "minecon_mode": false,
+    "reject": {
+      "family_locked": true,
+      "family_members": true,
+      "gamepass": true,
+      "underage": true,
+      "min_age_years": 18,
+      "check_hypixel_ban": false,
+      "check_donutsmp_ban": true
+    }
+  },
+  "coldproxy": {
+    "host": "",
+    "user": "",
+    "pass": "",
+    "port_min": 30000,
+    "port_max": 34999
+  },
+  "web": {
+    "credentials": {
+      "username": "dashboard_admin",
+      "password": "REPLACE_WITH_A_LONG_RANDOM_PASSWORD",
+      "jwt_secret": "REPLACE_WITH_64_HEX_CHARS_OR_LONG_RANDOM_STRING"
+    }
+  },
+  "domain": "yourdomain.com",
+  "proxy": {
+    "enabled": false,
+    "rotate_ssid": true,
+    "scheme": "http",
+    "proxies": []
+  },
+  "mail": {
+    "discord_webhook_all": "",
+    "discord_webhook_otp": "",
+    "otp_bridge_url": "",
+    "otp_bridge_token": ""
+  },
+  "autobuy": {
+    "price_per_mfa": 5.0,
+    "max_accounts_per_submit": 10,
+    "max_accounts_per_day": 10,
+    "pending_hours": 12,
+    "client_plus_role_id": "",
+    "client_plus_pending_hours": 3,
+    "security_email_check_interval_hours": 1,
+    "hold_check_interval_hours": 6,
+    "hold_check_enabled": true,
+    "min_withdraw_usd": 1.0,
+    "seller_role_id": "",
+    "ltc_usd_rate": null,
+    "embed": {
+      "title": "Sell Your Accounts",
+      "description": "Sell MFA accounts for Litecoin.\n\n**${price} per MFA**\nCredits unlock after **{pending}h** · Client+ **{client_plus_pending}h**\nSecurity-email check every **{sec_check}h** · lock check every **{check_hours}h**",
+      "color": 5763719,
+      "footer": "Paid in LTC"
+    },
+    "ltc_wallet": {
+      "wif": "",
+      "address": "",
+      "network": "litecoin"
+    }
+  }
+}
