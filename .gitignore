@@ -208,17 +208,94 @@ marimo/_lsp/
 __marimo__/
 
 CLAUDE.md
-database/database.db
 AGENTS.md
 
+# ---------------------------------------------------------------------------
+# Secrets & sensitive local data (never commit)
+# ---------------------------------------------------------------------------
+
+# Runtime config with bot tokens, webhooks, proxies, LTC WIF, etc.
 config/config.json
 /config.json
-database/*.db
-logs/*.log
-__pycache__/
-*.pyc
-.venv/
+*.local.json
+
+# Env files (all variants)
 .env
+.env.*
+!.env.example
+!.env.*.example
+
+# Databases & secured account stores
+database/*.db
+database/*.db-*
+database/*.sqlite
+database/*.sqlite3
+*.db
+*.sqlite3
+
+# Logs (may contain emails, OTPs, cookies, HTML dumps)
+logs/
+*.log
+
+# Proxies, account lists, credentials dumps
+proxy_list.txt
+proxy*.txt
+account_list.txt
+account_list*.txt
+!account_list.txt.example
+*credentials*.txt
+*accounts*.csv
+*accounts*.json
+cookies*.json
+*.cookies
+msa-cache/
+account-cache/
+.msa-cache*/
+*_mca-cache.json
+*_keypair.json
+
+# Crypto wallets / keys
+*.wif
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+*.wallet
+
+# Browser captures & debug dumps (often contain session tokens)
+*.har
+*.har.gz
+/tmp/
+tmp/
+/dumps/
+dumps/
+*_dump.html
+*_dump.txt
+catb_*.html
+login_*.html
+verify_*.html
+
+# Local secrets / backups
+secrets/
+*.bak
+*.backup
+*.secret
+recovery_codes*.txt
+
+# Ban-check Node deps (local install)
+minecraft/ban_check/node_modules/
+
+# PM2 / process dumps
+.pm2/
+pids/
+*.pid
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*~
 
 # Web build output & deps
 web/.output/

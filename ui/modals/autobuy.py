@@ -17,6 +17,44 @@ def _autobuy_cfg() -> dict:
         return json.load(f).get("autobuy") or {}
 
 
+def _member_has_role(member: discord.Member | None, role_id: int) -> bool:
+    if member is None or role_id <= 0:
+        return False
+    return any(r.id == role_id for r in getattr(member, "roles", []))
+
+
+async def _resolve_member(interaction: discord.Interaction) -> discord.Member | None:
+    user = interaction.user
+    if isinstance(user, discord.Member):
+        return user
+    guild = interaction.guild
+    if guild is None:
+        return None
+    try:
+        return await guild.fetch_member(user.id)
+    except discord.HTTPException:
+        return None
+
+
+async def pending_hours_for_seller(interaction: discord.Interaction) -> int:
+    """Hold duration: Client+ role gets shorter unlock; everyone else default."""
+    cfg = _autobuy_cfg()
+    default_hours = int(cfg.get("pending_hours") or 12)
+    plus_hours = int(cfg.get("client_plus_pending_hours") or 3)
+    role_raw = cfg.get("client_plus_role_id")
+    if not role_raw:
+        return default_hours
+    try:
+        role_id = int(role_raw)
+    except (TypeError, ValueError):
+        return default_hours
+
+    member = await _resolve_member(interaction)
+    if _member_has_role(member, role_id):
+        return max(1, plus_hours)
+    return default_hours
+
+
 def _owner_ids() -> list[int]:
     try:
         with open("config/config.json", "r") as f:
@@ -416,7 +454,7 @@ async def _send_seller_success_dm(
         name="Payout Unlock",
         value=(
             f"Credits unlock <t:{unlock_ts}:R> after hold **and** "
-            f"passing lock/pullback checks.\n"
+            f"passing Microsoft lock checks.\n"
             f"<t:{unlock_ts}:F>\n"
             f"_Each credit has its own {pending_hours}h timer._"
         ),
@@ -565,7 +603,7 @@ class WithdrawModal(ui.Modal):
         if amount > bals["available_usd"] + 1e-9:
             await interaction.followup.send(
                 f"Insufficient available balance. Available: **${bals['available_usd']:.2f}** "
-                f"(pending: **${bals['pending_usd']:.2f}** — each credit unlocks 24h after earn).",
+                f"(pending: **${bals['pending_usd']:.2f}** — each credit unlocks after its hold timer).",
                 ephemeral=True,
             )
             return
@@ -678,7 +716,7 @@ class SellMfaModal(ui.Modal):
         price = float(cfg.get("price_per_mfa") or 5.0)
         max_lines = int(cfg.get("max_accounts_per_submit") or 10)
         max_day = int(cfg.get("max_accounts_per_day") or 10)
-        pending_hours = int(cfg.get("pending_hours") or 24)
+        pending_hours = await pending_hours_for_seller(interaction)
 
         with DBConnection() as db:
             ltc = db.autobuy_get_ltc(interaction.user.id)
@@ -790,27 +828,17 @@ class SellMfaModal(ui.Modal):
                 with DBConnection() as db:
                     db.autobuy_record_sell(interaction.user.id, email, False)
 
-                # Always DM seller new credentials when recover already changed them
+                # Failure give-back: prefer hit_embed (includes new primary when replaced)
                 fail_embed = None
                 if isinstance(account, dict):
-                    # Never show post-secure primary (sunny@) to the seller
-                    fail_embed = account.get("seller_embed") or account.get("hit_embed")
+                    fail_embed = account.get("hit_embed") or account.get("seller_embed")
                     if fail_embed is None and account.get("credentials_changed"):
                         from securing.build_embeds import build_failure_embed
 
                         ms = account.get("microsoft") or {}
-                        # Prefer original login email for seller-facing failure DM
-                        seller_email = (
-                            ms.get("original_email")
-                            or email
-                        )
                         fail_embed = build_failure_embed(
-                            seller_email,
-                            {
-                                **ms,
-                                # Force copy-line to use original, not new primary
-                                "email": seller_email,
-                            },
+                            ms.get("original_email") or email,
+                            ms,
                             reason,
                             error=account.get("error") or reason,
                             credentials_changed=True,
@@ -835,9 +863,14 @@ class SellMfaModal(ui.Modal):
             unlock_dt = datetime.now(timezone.utc) + timedelta(hours=pending_hours)
             available_at = unlock_dt.strftime("%Y-%m-%d %H:%M:%S")
             unlock_ts = int(unlock_dt.timestamp())
-            check_hours = float(cfg.get("hold_check_interval_hours") or 6)
-            next_check = (
-                datetime.now(timezone.utc) + timedelta(hours=min(check_hours, pending_hours))
+            lock_hours = float(cfg.get("hold_check_interval_hours") or 6)
+            sec_hours = float(cfg.get("security_email_check_interval_hours") or 1)
+            now_utc = datetime.now(timezone.utc)
+            next_sec = (
+                now_utc + timedelta(hours=min(sec_hours, pending_hours))
+            ).strftime("%Y-%m-%d %H:%M:%S")
+            next_lock = (
+                now_utc + timedelta(hours=min(lock_hours, pending_hours))
             ).strftime("%Y-%m-%d %H:%M:%S")
 
             with DBConnection() as db:
@@ -847,7 +880,8 @@ class SellMfaModal(ui.Modal):
                     available_at,
                     "sell_mfa",
                     email,
-                    next_check_at=next_check,
+                    next_check_at=next_sec,
+                    next_lock_check_at=next_lock,
                 )
                 db.autobuy_record_sell(
                     interaction.user.id,

@@ -22,6 +22,16 @@ This fork adds fixes and features on top of upstream:
 | **Ops** | PM2 `ecosystem.config.cjs` for bot, API, and web |
 | **Ops** | `setup.sh` for venv, web build, and PM2 start |
 
+### Recent updates (2026-07-16)
+
+| Area | Change |
+|------|--------|
+| **Game Pass filter** | Rejects only **active** Xbox Game Pass / Ultimate. Expired, canceled, and Realms/M365 upsell noise no longer false-positive as Game Pass. |
+| **Autobuy hold** | Default credit hold **12h**; **Client+** role hold **3h** (`client_plus_role_id` / `client_plus_pending_hours`). |
+| **Hold checks** | Split schedule: security-email pullback every **1h** (masked GetCredentialType, no password/OTP); Microsoft lock check every **6h**. |
+| **CatB / overprotective** | Xbox SSO `proofs/Verify?mpcxt=CATB` completes via security-email OTP (SendOtt → VerifyProof, often 2 rounds), then `proofs/remind` with **Looks good**. Fixes false “No Minecraft” when Skip loops. |
+| **Cookies / canary** | `get_cookies` no longer crashes on missing `apiCanary` — securing continues into MC check instead of aborting mid-flow. |
+
 Upstream Discord invite and original docs are not affiliated with this fork.
 
 ---
@@ -118,6 +128,15 @@ Two config files control runtime behavior. **`config/config.json` is gitignored*
     "discord_webhook_otp": "https://discord.com/api/webhooks/...",
     "otp_bridge_url": "http://127.0.0.1:12798/otp",
     "otp_bridge_token": ""
+  },
+  "autobuy": {
+    "price_per_mfa": 5.0,
+    "pending_hours": 12,
+    "client_plus_role_id": "",
+    "client_plus_pending_hours": 3,
+    "security_email_check_interval_hours": 1,
+    "hold_check_interval_hours": 6,
+    "hold_check_enabled": true
   }
 }
 ```
@@ -129,7 +148,12 @@ Two config files control runtime behavior. **`config/config.json` is gitignored*
 | `mail.discord_webhook_otp` | Discord webhook when an OTP is detected |
 | `mail.otp_bridge_url` | Optional HTTP endpoint (e.g. playtime OTP bridge) |
 | `web.credentials` | Dashboard login + JWT secret |
-| `autosecure.*` | Alias replacement, 2FA, minecon mode |
+| `autosecure.*` | Alias replacement, 2FA, minecon mode, reject filters |
+| `autosecure.reject.gamepass` | Reject accounts with **active** Game Pass only |
+| `autobuy.pending_hours` | Default seller credit hold (hours) |
+| `autobuy.client_plus_*` | Shorter hold for Client+ Discord role |
+| `autobuy.security_email_check_interval_hours` | How often to verify security email still matches (pullback) |
+| `autobuy.hold_check_interval_hours` | How often to re-check Microsoft lock / suspended |
 
 ### `config/bot.json`
 
@@ -234,6 +258,9 @@ Command names can be renamed in `config/bot.json` or the dashboard.
 | Port 25 in use | Stop other SMTP (`pm2 stop mail` / smtp-discord); only one listener |
 | Emails not arriving | DNS A/MX, port 25 open, `domain` in config matches MX domain |
 | Wrong failure message on locked account | Re-pull this fork — lock detection runs before secure |
+| Rejected for Game Pass but GP expired | Re-pull — filter matches product title + active cycle only |
+| Secure stuck / false “No Minecraft” on CatB | Security email must receive OTP; bot completes Verify → remind LooksGood |
+| Autobuy credits stuck pending | Check `hold_check_enabled` and intervals; Client+ role shortens hold |
 | Dashboard login fails | `web.credentials` in `config/config.json` |
 | `git push` goes to wrong host | `git remote set-url origin https://github.com/waitno01/autosecure.git` |
 | Web build fails on Node 20 | Run `node node_modules/vite/bin/vite.js build` inside `web/` |
@@ -244,4 +271,9 @@ Command names can be renamed in `config/bot.json` or the dashboard.
 
 Use at your own risk. Automating Microsoft account flows may violate Microsoft's Terms of Service. This software is for educational purposes. The fork maintainers and upstream authors are not responsible for account actions taken by Microsoft or third parties.
 
-**Do not commit** `config/config.json`, `.env`, or `database/database.db` — they contain secrets and secured account data.
+**Do not commit** secrets or dumps. At minimum keep these out of git (see `.gitignore`):
+
+- `config/config.json` — bot token, webhooks, proxies, LTC WIF
+- `.env` / `.env.*`
+- `database/*.db` — secured accounts
+- `logs/`, `*.har`, cookie/cache dumps, `proxy_list.txt`, wallet keys

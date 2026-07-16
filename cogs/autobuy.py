@@ -46,22 +46,36 @@ class Autobuy(commands.Cog):
 
     @tasks.loop(minutes=15)
     async def _hold_check(self):
-        """Every 15m: run due lock/pullback checks on holding autobuy credits."""
+        """Every 15m: due security-email (1h) and lock (6h) checks on holding credits."""
         cfg = _autobuy_cfg()
         if cfg.get("hold_check_enabled", True) is False:
             return
-        interval = float(cfg.get("hold_check_interval_hours") or 6)
+        sec_interval = float(cfg.get("security_email_check_interval_hours") or 1)
+        lock_interval = float(cfg.get("hold_check_interval_hours") or 6)
         try:
-            result = await process_due_hold_checks(interval_hours=interval, limit=20)
+            result = await process_due_hold_checks(
+                security_interval_hours=sec_interval,
+                lock_interval_hours=lock_interval,
+                limit=20,
+            )
         except Exception:
             logger.exception("autobuy hold check loop failed")
             return
 
         stats = result.get("stats") or {}
-        if stats.get("checked") or stats.get("voided") or stats.get("cleared"):
+        if (
+            stats.get("checked")
+            or stats.get("voided")
+            or stats.get("cleared")
+            or stats.get("sec_checked")
+            or stats.get("lock_checked")
+        ):
             logger.info(
-                "autobuy hold check: checked=%s cleared=%s voided=%s rescheduled=%s skipped=%s",
+                "autobuy hold check: checked=%s sec=%s lock=%s cleared=%s voided=%s "
+                "rescheduled=%s skipped=%s",
                 stats.get("checked", 0),
+                stats.get("sec_checked", 0),
+                stats.get("lock_checked", 0),
                 stats.get("cleared", 0),
                 stats.get("voided", 0),
                 stats.get("rescheduled", 0),
@@ -87,7 +101,7 @@ class Autobuy(commands.Cog):
                     f"**Amount removed:** ${float(ev.get('amount_usd') or 0):.2f}\n"
                     f"**Reason:** {ev.get('reason') or 'unknown'}\n\n"
                     "Credits only become withdrawable after the hold period **and** "
-                    "passing periodic lock/credential checks."
+                    "passing periodic security-email + Microsoft lock checks."
                 ),
                 color=0xE74C3C,
             )

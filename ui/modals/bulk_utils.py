@@ -37,8 +37,9 @@ async def _secure_one(
         return {"email": email, "status": "failure", "note": "exception"}
 
     if isinstance(account, dict) and account.get("failed"):
+        # Bulk from /secure is admin — prefer hit_embed (new primary)
         await _send_failure_dm(
-            user, account.get("seller_embed") or account["hit_embed"]
+            user, account.get("hit_embed") or account["seller_embed"]
         )
         return {
             "email": email,
@@ -80,16 +81,17 @@ async def _secure_one(
         return {"email": email, "status": "failure", "note": "empty result"}
 
     try:
-        # Never DM sellers the post-secure primary (sunny@…) — owners use hit_embed.
-        seller_embed = account.get("seller_embed") or account["hit_embed"]
-        await user.send(embed=seller_embed)
+        # Bulk /secure is admin — hit_embed includes new primary.
+        # Autobuy has its own path and uses seller_embed there.
+        hit_embed = account.get("hit_embed") or account["seller_embed"]
+        await user.send(embed=hit_embed)
         return {"email": email, "status": "hit"}
     except discord.Forbidden:
         return {"email": email, "status": "hit", "note": "DMs disabled"}
     except KeyError:
         log.exception("Success result missing expected keys for %s", email)
         await _send_failure_dm(
-            user, account.get("seller_embed") or account.get("hit_embed")
+            user, account.get("hit_embed") or account.get("seller_embed")
         )
         return {"email": email, "status": "failure", "note": "incomplete result"}
 

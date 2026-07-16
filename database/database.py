@@ -97,7 +97,8 @@ class DBConnection:
                 status TEXT NOT NULL DEFAULT 'holding',
                 void_reason TEXT,
                 last_checked_at TIMESTAMP,
-                next_check_at TIMESTAMP
+                next_check_at TIMESTAMP,
+                next_lock_check_at TIMESTAMP
             );
 
             CREATE TABLE IF NOT EXISTS `autobuy_sells` (
@@ -137,6 +138,7 @@ class DBConnection:
             "ALTER TABLE autobuy_credits ADD COLUMN void_reason TEXT",
             "ALTER TABLE autobuy_credits ADD COLUMN last_checked_at TIMESTAMP",
             "ALTER TABLE autobuy_credits ADD COLUMN next_check_at TIMESTAMP",
+            "ALTER TABLE autobuy_credits ADD COLUMN next_lock_check_at TIMESTAMP",
         ):
             try:
                 self.cursor.execute(stmt)
@@ -148,7 +150,8 @@ class DBConnection:
             self.cursor.execute("""
                 UPDATE autobuy_credits
                 SET status = 'holding',
-                    next_check_at = COALESCE(next_check_at, CURRENT_TIMESTAMP)
+                    next_check_at = COALESCE(next_check_at, CURRENT_TIMESTAMP),
+                    next_lock_check_at = COALESCE(next_lock_check_at, CURRENT_TIMESTAMP)
                 WHERE remaining_usd > 0
                   AND COALESCE(status, 'holding') NOT IN ('voided', 'cleared')
             """)
@@ -494,13 +497,19 @@ class DBConnection:
         source: str,
         email: str,
         next_check_at: str | None = None,
+        next_lock_check_at: str | None = None,
     ) -> int:
         self.cursor.execute("""
             INSERT INTO autobuy_credits
                 (discord_id, amount_usd, remaining_usd, available_at, source, email,
-                 status, next_check_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'holding', COALESCE(?, CURRENT_TIMESTAMP))
-        """, (discord_id, amount_usd, amount_usd, available_at, source, email, next_check_at))
+                 status, next_check_at, next_lock_check_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'holding',
+                    COALESCE(?, CURRENT_TIMESTAMP),
+                    COALESCE(?, CURRENT_TIMESTAMP))
+        """, (
+            discord_id, amount_usd, amount_usd, available_at, source, email,
+            next_check_at, next_lock_check_at,
+        ))
         self.conn.commit()
         return int(self.cursor.lastrowid)
 
@@ -657,7 +666,7 @@ class DBConnection:
         self.conn.commit()
 
     def autobuy_credits_due_for_check(self, limit: int = 25) -> list[dict]:
-        """Holding credits whose next_check_at is due, with secured login creds."""
+        """Holding credits due for security-email and/or lock check."""
         rows = self.cursor.execute("""
             SELECT
                 c.id,
@@ -668,10 +677,12 @@ class DBConnection:
                 c.available_at,
                 c.status,
                 c.next_check_at,
+                c.next_lock_check_at,
                 s.account_id AS sell_account_id,
                 sa.account_id,
                 sa.ms_email,
-                sa.ms_password
+                sa.ms_password,
+                sa.ms_security_email
             FROM autobuy_credits c
             LEFT JOIN autobuy_sells s
                 ON s.credit_id = c.id AND s.success = 1
@@ -684,14 +695,20 @@ class DBConnection:
             )
             WHERE COALESCE(c.status, 'holding') = 'holding'
               AND c.remaining_usd > 0
-              AND (c.next_check_at IS NULL OR c.next_check_at <= CURRENT_TIMESTAMP)
-            ORDER BY COALESCE(c.next_check_at, c.created_at) ASC, c.id ASC
+              AND (
+                    c.next_check_at IS NULL
+                 OR c.next_check_at <= CURRENT_TIMESTAMP
+                 OR c.next_lock_check_at IS NULL
+                 OR c.next_lock_check_at <= CURRENT_TIMESTAMP
+              )
+            ORDER BY COALESCE(c.next_check_at, c.next_lock_check_at, c.created_at) ASC, c.id ASC
             LIMIT ?
         """, (limit,)).fetchall()
         keys = [
             "id", "discord_id", "email", "amount_usd", "remaining_usd",
-            "available_at", "status", "next_check_at", "sell_account_id",
-            "account_id", "ms_email", "ms_password",
+            "available_at", "status", "next_check_at", "next_lock_check_at",
+            "sell_account_id", "account_id", "ms_email", "ms_password",
+            "ms_security_email",
         ]
         return [dict(zip(keys, row)) for row in rows]
 
@@ -699,7 +716,8 @@ class DBConnection:
         self,
         credit_id: int,
         *,
-        next_check_at: str | None,
+        next_check_at: str | None = None,
+        next_lock_check_at: str | None = None,
         clear: bool = False,
     ) -> None:
         if clear:
@@ -708,6 +726,7 @@ class DBConnection:
                 SET status = 'cleared',
                     last_checked_at = CURRENT_TIMESTAMP,
                     next_check_at = NULL,
+                    next_lock_check_at = NULL,
                     void_reason = NULL
                 WHERE id = ? AND COALESCE(status, 'holding') = 'holding'
             """, (credit_id,))
@@ -715,9 +734,10 @@ class DBConnection:
             self.cursor.execute("""
                 UPDATE autobuy_credits
                 SET last_checked_at = CURRENT_TIMESTAMP,
-                    next_check_at = ?
+                    next_check_at = ?,
+                    next_lock_check_at = ?
                 WHERE id = ? AND COALESCE(status, 'holding') = 'holding'
-            """, (next_check_at, credit_id))
+            """, (next_check_at, next_lock_check_at, credit_id))
         self.conn.commit()
 
     def autobuy_void_credit(self, credit_id: int, reason: str) -> float:
@@ -735,7 +755,8 @@ class DBConnection:
                 remaining_usd = 0,
                 void_reason = ?,
                 last_checked_at = CURRENT_TIMESTAMP,
-                next_check_at = NULL
+                next_check_at = NULL,
+                next_lock_check_at = NULL
             WHERE id = ? AND COALESCE(status, 'holding') = 'holding'
         """, (reason[:500], credit_id))
         self.conn.commit()

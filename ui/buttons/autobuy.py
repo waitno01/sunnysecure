@@ -136,6 +136,38 @@ class LinkLtcButton(discord.ui.Button):
         asyncio.create_task(_bg_refresh_message(interaction.message))
 
 
+class WithdrawNowButton(discord.ui.Button):
+    def __init__(self, available_usd: float):
+        super().__init__(
+            label="Withdraw now",
+            emoji="💸",
+            style=discord.ButtonStyle.success,
+        )
+        self.available_usd = float(available_usd)
+
+    async def callback(self, interaction: discord.Interaction):
+        with DBConnection() as db:
+            bals = db.autobuy_balances(interaction.user.id)
+        available = float(bals.get("available_usd") or 0)
+        if available <= 0:
+            await interaction.response.send_message(
+                f"No withdrawable balance.\n"
+                f"Current balance: **${available:.2f}** · "
+                f"Pending: **${float(bals.get('pending_usd') or 0):.2f}**",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(WithdrawModal(available))
+
+
+class WithdrawBalanceView(discord.ui.View):
+    """Ephemeral confirm step before the amount modal."""
+
+    def __init__(self, available_usd: float):
+        super().__init__(timeout=180)
+        self.add_item(WithdrawNowButton(available_usd))
+
+
 class WithdrawButton(discord.ui.Button):
     def __init__(self):
         super().__init__(
@@ -158,17 +190,29 @@ class WithdrawButton(discord.ui.Button):
             asyncio.create_task(_bg_refresh_message(interaction.message))
             return
 
-        if bals["available_usd"] <= 0:
+        available = float(bals.get("available_usd") or 0)
+        pending = float(bals.get("pending_usd") or 0)
+        cfg = _autobuy_cfg()
+        min_withdraw = float(cfg.get("min_withdraw_usd") or 1.0)
+
+        if available <= 0:
             await interaction.response.send_message(
-                f"No withdrawable balance yet.\n"
-                f"Available: **${bals['available_usd']:.2f}** · "
-                f"Pending (24h): **${bals['pending_usd']:.2f}**",
+                f"**Current balance:** ${available:.2f}\n"
+                f"Pending: **${pending:.2f}**\n\n"
+                "Nothing withdrawable yet — credits unlock after the hold period.",
                 ephemeral=True,
             )
             asyncio.create_task(_bg_refresh_message(interaction.message))
             return
 
-        await interaction.response.send_modal(WithdrawModal(bals["available_usd"]))
+        await interaction.response.send_message(
+            f"**Current balance:** ${available:.2f}\n"
+            f"Pending: **${pending:.2f}**\n"
+            f"Minimum withdraw: **${min_withdraw:.2f}**\n\n"
+            "Click **Withdraw now** to enter an amount.",
+            view=WithdrawBalanceView(available),
+            ephemeral=True,
+        )
         asyncio.create_task(_bg_refresh_message(interaction.message))
 
 
@@ -216,15 +260,19 @@ def build_autobuy_embed(
     price = float(cfg.get("price_per_mfa") or 5.0)
     max_day = int(cfg.get("max_accounts_per_day") or 10)
     max_submit = int(cfg.get("max_accounts_per_submit") or 10)
-    pending = int(cfg.get("pending_hours") or 24)
+    pending = int(cfg.get("pending_hours") or 12)
+    client_plus_pending = int(cfg.get("client_plus_pending_hours") or 3)
     check_h = float(cfg.get("hold_check_interval_hours") or 6)
+    sec_check = float(cfg.get("security_email_check_interval_hours") or 1)
 
     description = (emb.get("description") or "").format(
         price=price,
         max_day=max_day,
         max_submit=max_submit,
         pending=pending,
+        client_plus_pending=client_plus_pending,
         check_hours=check_h,
+        sec_check=sec_check,
     )
 
     ltc_usd_line = "🏦 **Hot wallet:** unavailable"

