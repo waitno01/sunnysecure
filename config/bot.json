@@ -3,6 +3,7 @@
   "enabled_commands": {
     "real": {
       "accounts": false,
+      "addcredits": true,
       "auth_code": true,
       "autobuy": true,
       "check_lock": true,
@@ -22,6 +23,7 @@
     "fake": {},
     "aliases": {
       "auth_code": "auth_code",
+      "addcredits": "addcredits",
       "autobuy": "autobuy",
       "check_lock": "check",
       "checkbalance": "checkbalance",

@@ -5,7 +5,7 @@ import asyncio
 import discord
 
 from database.database import DBConnection
-from ui.modals.autobuy import LinkLtcModal, SellMfaModal, WithdrawModal
+from ui.modals.autobuy import LinkLtcModal, SellMfaModal, Sell2faModal, WithdrawModal
 
 logger = logging.getLogger("bot")
 
@@ -66,12 +66,32 @@ async def refresh_autobuy_panels(bot: discord.Client, *, force: bool = False) ->
             if channel is None:
                 channel = await bot.fetch_channel(panel["channel_id"])
             msg = await channel.fetch_message(panel["message_id"])
+            # Stale rows from other bots / old deployments — cannot edit those
+            if bot.user and msg.author.id != bot.user.id:
+                with DBConnection() as db:
+                    db.autobuy_remove_panel(panel["message_id"])
+                logger.warning(
+                    "Removed foreign-authored autobuy panel %s (author=%s)",
+                    panel["message_id"],
+                    msg.author.id,
+                )
+                continue
             await msg.edit(embed=embed, view=view)
             edited += 1
         except discord.NotFound:
             with DBConnection() as db:
                 db.autobuy_remove_panel(panel["message_id"])
             logger.info("Removed missing autobuy panel %s", panel["message_id"])
+        except discord.Forbidden as exc:
+            # Message authored by another bot/user — cannot edit; drop from DB
+            with DBConnection() as db:
+                db.autobuy_remove_panel(panel["message_id"])
+            logger.warning(
+                "Removed non-editable autobuy panel %s in channel %s (%s)",
+                panel["message_id"],
+                panel["channel_id"],
+                getattr(exc, "code", exc),
+            )
         except Exception:
             logger.exception(
                 "Failed to refresh autobuy panel %s in channel %s",
@@ -198,8 +218,10 @@ class WithdrawButton(discord.ui.Button):
         if available <= 0:
             await interaction.response.send_message(
                 f"**Current balance:** ${available:.2f}\n"
-                f"Pending: **${pending:.2f}**\n\n"
-                "Nothing withdrawable yet — credits unlock after the hold period.",
+                f"Pending: **${pending:.2f}**\n"
+                f"**Linked LTC:** `{ltc}`\n\n"
+                "Nothing withdrawable yet — credits unlock after the hold period.\n"
+                "Use **Link LTC** to change this address.",
                 ephemeral=True,
             )
             asyncio.create_task(_bg_refresh_message(interaction.message))
@@ -208,8 +230,10 @@ class WithdrawButton(discord.ui.Button):
         await interaction.response.send_message(
             f"**Current balance:** ${available:.2f}\n"
             f"Pending: **${pending:.2f}**\n"
-            f"Minimum withdraw: **${min_withdraw:.2f}**\n\n"
-            "Click **Withdraw now** to enter an amount.",
+            f"Minimum withdraw: **${min_withdraw:.2f}**\n"
+            f"**Linked LTC:** `{ltc}`\n\n"
+            "Click **Withdraw now** to enter an amount.\n"
+            "Use **Link LTC** to change this address.",
             view=WithdrawBalanceView(available),
             ephemeral=True,
         )
@@ -219,7 +243,7 @@ class WithdrawButton(discord.ui.Button):
 class SellMfaButton(discord.ui.Button):
     def __init__(self):
         super().__init__(
-            label="Sell MFA",
+            label="Sell (Rec code)",
             emoji="💰",
             style=discord.ButtonStyle.success,
             custom_id="persistent:autobuy_sell_mfa",
@@ -241,13 +265,38 @@ class SellMfaButton(discord.ui.Button):
         asyncio.create_task(_bg_refresh_message(interaction.message))
 
 
+class Sell2faButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="Sell (2FA)",
+            emoji="🔐",
+            style=discord.ButtonStyle.primary,
+            custom_id="persistent:autobuy_sell_2fa",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        with DBConnection() as db:
+            ltc = db.autobuy_get_ltc(interaction.user.id)
+
+        if not ltc:
+            await interaction.response.send_message(
+                "Link an LTC address first using **Link LTC**.",
+                ephemeral=True,
+            )
+            asyncio.create_task(_bg_refresh_message(interaction.message))
+            return
+
+        await interaction.response.send_modal(Sell2faModal())
+        asyncio.create_task(_bg_refresh_message(interaction.message))
+
+
 class AutobuyView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(LinkLtcButton())
         self.add_item(WithdrawButton())
         self.add_item(SellMfaButton())
-
+        self.add_item(Sell2faButton())
 
 def build_autobuy_embed(
     snapshot: dict | None = None,
@@ -263,7 +312,8 @@ def build_autobuy_embed(
     pending = int(cfg.get("pending_hours") or 12)
     client_plus_pending = int(cfg.get("client_plus_pending_hours") or 3)
     check_h = float(cfg.get("hold_check_interval_hours") or 6)
-    sec_check = float(cfg.get("security_email_check_interval_hours") or 1)
+    lock_second = float(cfg.get("hold_check_second_interval_hours") or (5.0 + 50.0 / 60.0))
+    sec_check = float(cfg.get("security_email_check_interval_hours") or 2)
 
     description = (emb.get("description") or "").format(
         price=price,
@@ -272,6 +322,7 @@ def build_autobuy_embed(
         pending=pending,
         client_plus_pending=client_plus_pending,
         check_hours=check_h,
+        lock_second=round(lock_second, 2),
         sec_check=sec_check,
     )
 

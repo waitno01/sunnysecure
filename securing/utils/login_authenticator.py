@@ -78,17 +78,86 @@ def _login_error_reason(html: str) -> str | None:
     return None
 
 
+def _page_fingerprint(html: str) -> str:
+    """Short markers for diagnosing unexpected post-password pages."""
+    lower = (html or "").lower()
+    title_m = re.search(r"<title[^>]*>(.*?)</title>", html or "", re.I | re.DOTALL)
+    title = re.sub(r"\s+", " ", title_m.group(1)).strip()[:60] if title_m else "?"
+    flags = []
+    for needle, label in (
+        ("arrUserProofs", "proofs"),
+        ("interrupt/passkey", "passkey"),
+        ("identity/confirm", "idconfirm"),
+        ("privacynotice", "notice"),
+        ("kmsi", "kmsi"),
+        ("i5245", "i5245"),
+        ("i5600", "i5600"),
+        ("otc", "otc"),
+        ("hip", "hip"),
+        ("abuse", "abuse"),
+        ("something went wrong", "sww"),
+    ):
+        if needle in lower or needle in (html or ""):
+            flags.append(label)
+    return f"title={title!r} flags={','.join(flags) or 'none'} len={len(html or '')}"
+
+
+async def _try_pick_authenticator_proof(session: httpx.AsyncClient, html: str) -> str:
+    """If MS shows 'other ways to sign in', switch to authenticator (type 10/14)."""
+    if "arrUserProofs" in (html or "") and _extract_totp_proof(html):
+        return html
+
+    # Some pages list proofs but default to email/SMS — pick type 10/14 explicitly.
+    proof = _extract_totp_proof(html or "")
+    if proof:
+        return html
+
+    # Look for an auth-method switch URL / form that targets TOTP / authenticator app
+    switch = (
+        re.search(
+            r'href="(https://login\.live\.com[^"]*(?:authMethod|otc|totp|Proof)[^"]*)"',
+            html or "",
+            re.I,
+        )
+        or re.search(
+            r'"urlPost"\s*:\s*"(https://login\.live\.com[^"]+)"[^}]{0,400}"type"\s*:\s*(?:10|14)',
+            html or "",
+            re.DOTALL,
+        )
+    )
+    if switch:
+        try:
+            resp = await session.get(switch.group(1).replace("&amp;", "&"), follow_redirects=True)
+            return resp.text
+        except Exception:
+            logging.exception("authenticator proof switch GET failed")
+
+    return html
+
+
 async def _resolve_post_password_page(session: httpx.AsyncClient, html: str) -> str:
     """Follow Continue/passkey/pprid interstitials until a stable login page."""
     current = html
-    for _ in range(6):
-        if "arrUserProofs" in current:
+    for _ in range(8):
+        if "arrUserProofs" in current and _extract_totp_proof(current):
             return current
         if _has_session(session) and 'complete-sso' in current.lower():
             return current
 
         action_match = re.search(r'action="([^"]+)"', current)
         action = action_match.group(1) if action_match else ""
+
+        # JSON-escaped passkey interrupt (action= may be missing / encoded)
+        if "interrupt/passkey" in current and "interrupt/passkey" not in action:
+            enc = re.search(
+                r'action=\\?"(https:[^"\\]*interrupt/passkey[^"\\]*)\\?"',
+                current,
+            ) or re.search(
+                r'(https://login\.live\.com/[^"\s]*interrupt/passkey[^"\s]*)',
+                current,
+            )
+            if enc:
+                action = enc.group(1).replace("\\u0026", "&").replace("&amp;", "&")
 
         # Auto-submit Continue form → interrupt/passkey
         if "interrupt/passkey" in action or (
@@ -118,6 +187,11 @@ async def _resolve_post_password_page(session: httpx.AsyncClient, html: str) -> 
             except Exception:
                 logging.exception("handle_redirects failed during authpwd")
                 break
+
+        switched = await _try_pick_authenticator_proof(session, current)
+        if switched != current:
+            current = switched
+            continue
 
         break
 
@@ -203,9 +277,16 @@ async def login_authenticator(session: httpx.AsyncClient, email: str, data: dict
                 print("[+] - Logged in without TOTP challenge (passkey/KMSI path)")
                 return True
 
+        fp = _page_fingerprint(page)
+        logging.warning(
+            "authpwd no TOTP after password for %s — %s snippet=%r",
+            email,
+            fp,
+            (page or "")[:500],
+        )
         reason = _login_error_reason(page) or (
             "Password accepted but Microsoft did not show an authenticator challenge "
-            "(passkey interrupt / unexpected page). TOTP was not requested."
+            f"(passkey interrupt / unexpected page; {fp}). TOTP was not requested."
         )
         print(f"[X] - {reason}")
         return reason

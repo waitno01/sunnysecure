@@ -64,6 +64,11 @@ async def _profile_from_ssid(ssid: str) -> dict | None:
                 headers={"Authorization": f"Bearer {ssid}"},
             )
             if resp.status_code != 200:
+                logger.warning(
+                    "ban check profile fetch status=%s body=%s",
+                    resp.status_code,
+                    (resp.text or "")[:200],
+                )
                 return None
             data = resp.json()
             if data.get("name") and data.get("id"):
@@ -71,6 +76,26 @@ async def _profile_from_ssid(ssid: str) -> dict | None:
     except Exception:
         logger.exception("Failed to fetch MC profile for ban check")
     return None
+
+
+async def _uuid_from_name(name: str) -> str | None:
+    """Resolve Java UUID from IGN via Mojang (no SSID needed)."""
+    name = (name or "").strip()
+    if not name:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                f"https://api.mojang.com/users/profiles/minecraft/{name}"
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            uid = data.get("id")
+            return str(uid) if uid else None
+    except Exception:
+        logger.exception("Failed to resolve UUID for %s", name)
+        return None
 
 
 def _run_check_sync(
@@ -154,6 +179,21 @@ async def check_server_ban(
         if profile:
             name = name or profile["name"]
             uuid = uuid or profile["uuid"]
+    # Profile API often flakes (401/429) right after secure — fall back to Mojang
+    # so we can still join with the IGN we already scraped.
+    if name and not uuid:
+        uuid = await _uuid_from_name(name)
+        if uuid:
+            logger.info("ban check resolved UUID via Mojang for %s", name)
+    if not name or not uuid:
+        return {
+            "status": "error",
+            "reason": (
+                "No Java profile/UUID for ban check "
+                f"(name={name!r} uuid={uuid!r}) — cannot join"
+            ),
+            "attempts": 0,
+        }
 
     # One Node attempt per Python loop so each retry gets a fresh ColdProxy SSID/IP
     max_attempts = 3
@@ -161,11 +201,12 @@ async def check_server_ban(
     for attempt in range(1, max_attempts + 1):
         proxy = _coldproxy_line(cfg)  # new {ssid} / gateway port each try
         logger.info(
-            "ban check %s attempt=%s/%s proxy=%s",
+            "ban check %s attempt=%s/%s proxy=%s name=%s",
             server_key,
             attempt,
             max_attempts,
             (proxy.split(":")[1] if proxy else "none"),
+            name,
         )
         result = await asyncio.to_thread(
             _run_check_sync,
@@ -202,6 +243,8 @@ async def check_server_ban(
                 "transient",
                 "throttl",
                 "try again",
+                "no java profile",
+                "profile fetch",
             )
         ):
             await asyncio.sleep(1.5 * attempt)
@@ -243,17 +286,21 @@ async def apply_ban_checks(account: dict) -> str | None:
 
     mc = account.get("minecraft") or {}
     name = mc.get("name")
+    uuid = mc.get("uuid") or mc.get("id")
     if name and (
         "no minecraft" in str(name).lower()
         or "failed" in str(name).lower()
         or "no java" in str(name).lower()
     ):
         name = None
+        uuid = None
+    if uuid:
+        uuid = str(uuid).replace("-", "")
 
     for key in wanted:
         label = SERVERS[key]["label"]
         print(f"[~] - Checking {label} ban status...")
-        result = await check_server_ban(key, ssid, name=name)
+        result = await check_server_ban(key, ssid, name=name, uuid=uuid)
         status = result.get("status")
         reason = result.get("reason") or "unknown"
         ban_id = result.get("ban_id")
@@ -273,6 +320,26 @@ async def apply_ban_checks(account: dict) -> str | None:
                 detail = f"{reason} (Ban ID #{ban_id})"
             # Infrastructure / script failures must not reject the account
             soft = str(reason or "").lower()
+            # DonutSMP Discord verify / unauthorized-login prompt is NOT a ban
+            if any(
+                x in soft
+                for x in (
+                    "unauthorized login",
+                    "possible unauthorized",
+                    "confirm it via the button in your discord",
+                    "direct messages enabled in the donutsmp",
+                    "verified on the discord",
+                    "for your own safety we've blocked it",
+                    "discord_security_prompt",
+                )
+            ):
+                logger.info(
+                    "ban check %s discord security prompt — NOT rejecting: %s",
+                    key,
+                    reason[:200] if isinstance(reason, str) else reason,
+                )
+                print(f"[+] - {label}: discord security prompt (not a ban) — continuing")
+                continue
             if any(
                 x in soft
                 for x in (
@@ -316,6 +383,15 @@ async def apply_ban_checks(account: dict) -> str | None:
                 "already online",
                 "already connected",
                 "request-join-cache",
+                "no java profile",
+                "profile fetch",
+                "cannot join",
+                "missing --host",
+                "missing minecraft session",
+                "unauthorized login",
+                "possible unauthorized",
+                "discord",
+                "direct messages enabled",
             )
         ):
             logger.error(

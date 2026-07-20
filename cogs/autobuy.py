@@ -4,6 +4,7 @@ import json
 import logging
 
 from ui.buttons.autobuy import AutobuyView, build_autobuy_embed, refresh_autobuy_panels
+from ui.modals.autobuy import _dm_owners
 from payments.ltc_wallet import get_ltc_wallet
 from database.database import DBConnection
 from securing.autobuy_hold_check import process_due_hold_checks
@@ -11,6 +12,9 @@ from securing.autobuy_hold_check import process_due_hold_checks
 bot_config = json.load(open("config/bot.json", "r"))
 name = bot_config["enabled_commands"]["aliases"]["autobuy"]
 logger = logging.getLogger("bot")
+
+# 5 hours 50 minutes
+_DEFAULT_LOCK_SECOND_HOURS = 5.0 + 50.0 / 60.0
 
 
 def _autobuy_cfg() -> dict:
@@ -46,16 +50,20 @@ class Autobuy(commands.Cog):
 
     @tasks.loop(minutes=15)
     async def _hold_check(self):
-        """Every 15m: due security-email (1h) and lock (6h) checks on holding credits."""
+        """Every 15m: grace-only validity (2h) + lock (6h then +5h50m); clear after grace."""
         cfg = _autobuy_cfg()
         if cfg.get("hold_check_enabled", True) is False:
             return
-        sec_interval = float(cfg.get("security_email_check_interval_hours") or 1)
+        sec_interval = float(cfg.get("security_email_check_interval_hours") or 2)
         lock_interval = float(cfg.get("hold_check_interval_hours") or 6)
+        lock_second = float(
+            cfg.get("hold_check_second_interval_hours") or _DEFAULT_LOCK_SECOND_HOURS
+        )
         try:
             result = await process_due_hold_checks(
                 security_interval_hours=sec_interval,
                 lock_interval_hours=lock_interval,
+                lock_second_interval_hours=lock_second,
                 limit=20,
             )
         except Exception:
@@ -69,13 +77,15 @@ class Autobuy(commands.Cog):
             or stats.get("cleared")
             or stats.get("sec_checked")
             or stats.get("lock_checked")
+            or stats.get("partial")
         ):
             logger.info(
-                "autobuy hold check: checked=%s sec=%s lock=%s cleared=%s voided=%s "
-                "rescheduled=%s skipped=%s",
+                "autobuy hold check: checked=%s sec=%s lock=%s partial=%s cleared=%s "
+                "voided=%s rescheduled=%s skipped=%s",
                 stats.get("checked", 0),
                 stats.get("sec_checked", 0),
                 stats.get("lock_checked", 0),
+                stats.get("partial", 0),
                 stats.get("cleared", 0),
                 stats.get("voided", 0),
                 stats.get("rescheduled", 0),
@@ -85,32 +95,130 @@ class Autobuy(commands.Cog):
         for ev in result.get("void_events") or []:
             await self._dm_void(ev)
 
+        for ev in result.get("partial_events") or []:
+            await self._dm_partial(ev)
+
     @_hold_check.before_loop
     async def _before_hold_check(self):
         await self.bot.wait_until_ready()
 
     async def _dm_void(self, ev: dict) -> None:
+        """Account invalid during grace — DM seller + owners."""
+        email = ev.get("email") or "?"
+        reason = ev.get("reason") or "unknown"
+        amount = float(ev.get("amount_usd") or 0)
+        seller_id = ev.get("discord_id")
+        credit_id = ev.get("credit_id")
+        available = ev.get("available_at") or "unknown"
+
+        seller_embed = discord.Embed(
+            title="Credit voided — account failed hold check",
+            description=(
+                f"Account `{email}` failed a post-sale security check.\n"
+                f"**Amount removed:** ${amount:.2f}\n"
+                f"**Reason:** {reason}\n\n"
+                "Credits only become withdrawable after the hold period **and** "
+                "passing periodic security-email + Microsoft lock checks."
+            ),
+            color=0xE74C3C,
+        )
+
+        owner_embed = discord.Embed(
+            title="Autobuy voided — invalid during grace",
+            description=(
+                f"**Seller:** <@{seller_id}>\n"
+                f"**Account:** `{email}`\n"
+                f"**Credit ID:** `{credit_id}`\n"
+                f"**Amount removed:** ${amount:.2f}\n"
+                f"**Reason:** {reason}\n"
+                f"**Grace was until:** `{available}`\n\n"
+                "Credit voided while still in the pending grace window."
+            ),
+            color=0xE74C3C,
+        )
+
         try:
-            user = self.bot.get_user(ev["discord_id"])
+            user = self.bot.get_user(seller_id)
             if user is None:
-                user = await self.bot.fetch_user(ev["discord_id"])
-            embed = discord.Embed(
-                title="Credit voided — account failed hold check",
-                description=(
-                    f"Account `{ev.get('email')}` failed a post-sale security check.\n"
-                    f"**Amount removed:** ${float(ev.get('amount_usd') or 0):.2f}\n"
-                    f"**Reason:** {ev.get('reason') or 'unknown'}\n\n"
-                    "Credits only become withdrawable after the hold period **and** "
-                    "passing periodic security-email + Microsoft lock checks."
-                ),
-                color=0xE74C3C,
-            )
-            await user.send(embed=embed)
+                user = await self.bot.fetch_user(seller_id)
+            await user.send(embed=seller_embed)
         except Exception:
             logger.exception(
-                "Failed to DM void notice to %s for %s",
-                ev.get("discord_id"),
-                ev.get("email"),
+                "Failed to DM void notice to seller %s for %s",
+                seller_id,
+                email,
+            )
+
+        try:
+            await _dm_owners(self.bot, embeds=[owner_embed])
+        except Exception:
+            logger.exception(
+                "Failed to DM owners about void credit=%s email=%s",
+                credit_id,
+                email,
+            )
+
+    async def _dm_partial(self, ev: dict) -> None:
+        """RC invalid but security email still OK — alert seller + owners, keep holding."""
+        email = ev.get("email") or "?"
+        detail = ev.get("detail") or "Recovery code invalid; security email still present"
+        amount = float(ev.get("amount_usd") or 0)
+        available = ev.get("available_at") or "unknown"
+        credit_id = ev.get("credit_id")
+        seller_id = ev.get("discord_id")
+
+        seller_embed = discord.Embed(
+            title="Partial hold warning — recovery code invalid",
+            description=(
+                f"Account `{email}` failed the recovery-code check, but our security "
+                f"email is **still present** on the account.\n\n"
+                f"**Detail:** {detail}\n"
+                f"**Pending credit:** ${amount:.2f}\n"
+                f"**Grace ends:** `{available}`\n\n"
+                "Your credit is **still holding** (not voided). "
+                "If the buyer pulls the account fully (security email removed), "
+                "the credit will be voided on a later check."
+            ),
+            color=0xF1C40F,
+        )
+
+        owner_embed = discord.Embed(
+            title="Autobuy partial — RC bad, security email OK",
+            description=(
+                f"**Seller:** <@{seller_id}>\n"
+                f"**Account:** `{email}`\n"
+                f"**Credit ID:** `{credit_id}`\n"
+                f"**Amount:** ${amount:.2f}\n"
+                f"**RC source:** `{ev.get('rc_source') or 'unknown'}`\n"
+                f"**Detail:** {detail}\n"
+                f"**Grace ends:** `{available}`\n\n"
+                "Credit remains in hold (not voided). Validity checks continue "
+                "during grace; void only if security email is also gone."
+            ),
+            color=0xF1C40F,
+        )
+
+        # Seller
+        try:
+            user = self.bot.get_user(seller_id)
+            if user is None:
+                user = await self.bot.fetch_user(seller_id)
+            await user.send(embed=seller_embed)
+        except Exception:
+            logger.exception(
+                "Failed to DM partial notice to seller %s for %s",
+                seller_id,
+                email,
+            )
+
+        # Owners
+        try:
+            await _dm_owners(self.bot, embeds=[owner_embed])
+        except Exception:
+            logger.exception(
+                "Failed to DM owners about partial credit=%s email=%s",
+                credit_id,
+                email,
             )
 
     @discord.slash_command(name=name, description="Post the account selling (autobuy) panel")

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import date, datetime
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 
 def _load_reject_cfg() -> dict:
@@ -20,6 +23,13 @@ def _load_reject_cfg() -> dict:
             "gamepass": reject.get("gamepass", True),
             "underage": reject.get("underage", True),
             "min_age_years": int(reject.get("min_age_years") or 18),
+            # When replace_main_alias ran and failed — do not sell/credit
+            "require_primary_alias": reject.get("require_primary_alias", True),
+            # HasPhone on GetCredentialType is almost always 1 even with no SMS
+            # proof (ghost flag). Do NOT hard-reject on it — only reject when we
+            # actually scraped an SMS/phone proof row on proofs/Manage.
+            "require_no_phone": reject.get("require_no_phone", False),
+            "require_no_sms_proof": reject.get("require_no_sms_proof", True),
         }
     except Exception:
         return {
@@ -28,6 +38,9 @@ def _load_reject_cfg() -> dict:
             "gamepass": True,
             "underage": True,
             "min_age_years": 18,
+            "require_primary_alias": True,
+            "require_no_phone": False,
+            "require_no_sms_proof": True,
         }
 
 
@@ -353,5 +366,55 @@ def rejection_reason(account_info: dict | None, *, cfg: dict | None = None) -> s
             age = _age_years(dob)
             if age < min_age:
                 return f"Account is underage (DOB age {age} < {min_age})."
+
+    # RecoverUser sometimes returns OK but the new password never sticks.
+    # Buyers get password + recovery code (not our security inbox). Reject only
+    # when there is also no usable recovery code to reclaim the account.
+    pwd = str(ms.get("password") or "")
+    if "UNVERIFIED" in pwd:
+        rc = str(ms.get("recovery_code") or "").strip().upper().replace(" ", "")
+        rc_ok = bool(re.fullmatch(r"[A-Z0-9]{5}(?:-[A-Z0-9]{5}){4}", rc))
+        if not rc_ok:
+            return (
+                "Password did not stick after RecoverUser (UNVERIFIED) — "
+                "account not buyer-usable."
+            )
+        # Valid RC: buyer can reset password themselves. Strip the annotation so
+        # payouts aren't blocked by a login.live.com verify flake.
+        ms["password"] = re.sub(
+            r"\s*\(UNVERIFIED[^)]*\)\s*$", "", pwd
+        ).strip() or pwd
+        log.warning(
+            "Allowing sell with recovery code despite UNVERIFIED password "
+            "(email=%s)",
+            ms.get("email") or ms.get("original_email"),
+        )
+
+    # Failed sunny/primary replace leaves the seller's original Outlook login
+    # intact → easy pullback. Autobuy must not credit these.
+    if rules.get("require_primary_alias", True):
+        replaced = ms.get("primary_alias_replaced")
+        if replaced is False:
+            old = str(ms.get("original_email") or "").strip() or "original"
+            kept = str(ms.get("email") or "").strip() or "unknown"
+            return (
+                f"Failed to replace primary email after retries "
+                f"(still {kept}; submitted {old})."
+            )
+
+    # HasPhone GetCredentialType flag is nearly always 1 (even with no SMS proof).
+    # Only reject when we scraped a real SMS/phone proof on proofs/Manage.
+    if rules.get("require_no_sms_proof", True):
+        if ms.get("has_sms_proof") is True:
+            return (
+                "Account still has an SMS/phone security proof after wipe — "
+                "high pullback risk; returned to seller."
+            )
+    if rules.get("require_no_phone", False):
+        if ms.get("has_phone") is True:
+            return (
+                "Account still has phone recovery (HasPhone=1) after secure — "
+                "high pullback risk; returned to seller."
+            )
 
     return None

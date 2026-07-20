@@ -3,9 +3,13 @@ from web.limiter import limiter
 from slowapi.middleware import SlowAPIMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI
+from database.database import DBConnection
 import os
 
 app = FastAPI()
+
+with DBConnection() as _db:
+    _db.setup_tables()
 
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)

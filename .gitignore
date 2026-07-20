@@ -256,6 +256,15 @@ account-cache/
 .msa-cache*/
 *_mca-cache.json
 *_keypair.json
+*_live-cache.json
+*_player-certs.json
+
+# Forensic / experiment dumps (live passwords, RCs, cookies, HTML, HARs)
+forensics/
+*_LIVE_CREDS*
+*LIVE_CREDS*
+activity_*.html
+activity_*.json
 
 # Crypto wallets / keys
 *.wif
@@ -278,6 +287,8 @@ dumps/
 catb_*.html
 login_*.html
 verify_*.html
+proofs_*.html
+*_proofs_*.html
 
 # Local secrets / backups
 secrets/
@@ -285,6 +296,9 @@ secrets/
 *.backup
 *.secret
 recovery_codes*.txt
+*.totp
+*.otp
+auth_secrets*.txt
 
 # Ban-check Node deps (local install)
 minecraft/ban_check/node_modules/

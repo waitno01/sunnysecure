@@ -3,7 +3,7 @@ import httpx
 from minecraft.retry import TransientMCError, with_retries
 
 
-async def _get_profile_once(ssid: str) -> str | None:
+async def _get_profile_once(ssid: str) -> dict | None:
     async with httpx.AsyncClient(timeout=30.0) as session:
         response = await session.get(
             url="https://api.minecraftservices.com/minecraft/profile",
@@ -26,7 +26,7 @@ async def _get_profile_once(ssid: str) -> str | None:
             raise TransientMCError(f"profile non-JSON: {exc}") from exc
 
         if "name" in rjson:
-            return rjson["name"]
+            return {"name": rjson["name"], "uuid": rjson.get("id")}
 
         # Unexpected empty body / error shape — retry
         if response.status_code != 200:
@@ -35,7 +35,7 @@ async def _get_profile_once(ssid: str) -> str | None:
         return None
 
 
-async def get_profile(ssid: str) -> str | None:
+async def get_profile(ssid: str) -> dict | None:
     return await with_retries(
         "get_profile",
         lambda: _get_profile_once(ssid),

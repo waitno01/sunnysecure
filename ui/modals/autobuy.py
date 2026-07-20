@@ -229,14 +229,26 @@ def _owner_hit_embed(
         color=0x57F287,
         timestamp=datetime.now(timezone.utc),
     )
-    embed.add_field(name="Submitted email", value=f"```{submitted_email}```", inline=False)
+    embed.add_field(name="Submitted email (old)", value=f"```{submitted_email}```", inline=True)
     embed.add_field(name="Payout", value=f"**${price:.2f}** pending **{pending_hours}h**", inline=True)
     embed.add_field(name="Credit ID", value=f"`{credit_id}`", inline=True)
     embed.add_field(name="Account ID", value=f"`{account_id}`", inline=True)
 
     if ms:
-        embed.add_field(name="Primary email", value=f"```{ms.get('email', '—')}```", inline=False)
-        embed.add_field(name="Security email", value=f"```{ms.get('security_email', '—')}```", inline=True)
+        primary = str(ms.get("email") or "—").strip() or "—"
+        old = str(
+            ms.get("original_email") or submitted_email or "—"
+        ).strip() or "—"
+        embed.add_field(name="Old email", value=f"```{old}```", inline=True)
+        if old.lower() != primary.lower():
+            embed.add_field(name="New email (primary)", value=f"```{primary}```", inline=True)
+        else:
+            embed.add_field(
+                name="New email (primary)",
+                value=f"```{primary}```\n_Alias not replaced_",
+                inline=True,
+            )
+        embed.add_field(name="Security email", value=f"```{ms.get('security_email', '—')}```", inline=False)
         embed.add_field(name="Password", value=f"```{ms.get('password', '—')}```", inline=True)
         embed.add_field(name="Recovery code", value=f"```{ms.get('recovery_code', '—')}```", inline=False)
         if ms.get("auth_secret"):
@@ -377,8 +389,9 @@ async def _notify_owners_batch_summary(
 
 
 async def _grant_seller_role(interaction: discord.Interaction) -> None:
-    """Assign the configured seller role after a successful MFA sell."""
-    role_raw = _autobuy_cfg().get("seller_role_id")
+    """Assign the configured seller/client role after a successful MFA sell."""
+    cfg = _autobuy_cfg()
+    role_raw = cfg.get("seller_role_id")
     if not role_raw:
         return
     try:
@@ -386,26 +399,99 @@ async def _grant_seller_role(interaction: discord.Interaction) -> None:
     except (TypeError, ValueError):
         return
 
+    # Prefer the interaction guild; fall back to configured / panel guild.
     guild = interaction.guild
     if guild is None:
+        guild_raw = cfg.get("guild_id")
+        if guild_raw:
+            try:
+                guild = interaction.client.get_guild(int(guild_raw))
+            except (TypeError, ValueError):
+                guild = None
+        if guild is None:
+            # Last resort: any guild that actually has the role
+            for g in getattr(interaction.client, "guilds", []) or []:
+                if g.get_role(role_id) is not None:
+                    guild = g
+                    break
+    if guild is None:
+        logger.error(
+            "seller role grant: no guild available for role %s (user=%s)",
+            role_id,
+            interaction.user.id,
+        )
         return
 
-    member = interaction.user
-    if not isinstance(member, discord.Member):
-        try:
+    try:
+        member = guild.get_member(interaction.user.id)
+        if member is None:
             member = await guild.fetch_member(interaction.user.id)
-        except discord.HTTPException:
-            return
+    except discord.HTTPException:
+        logger.exception(
+            "seller role grant: cannot fetch member %s in guild %s",
+            interaction.user.id,
+            guild.id,
+        )
+        return
 
     if any(r.id == role_id for r in member.roles):
         return
 
     role = guild.get_role(role_id)
     if role is None:
+        logger.error(
+            "seller role grant: role %s not found in guild %s (%s)",
+            role_id,
+            guild.id,
+            guild.name,
+        )
         return
+
+    me = guild.me
+    if me is None:
+        try:
+            me = await guild.fetch_member(interaction.client.user.id)
+        except discord.HTTPException:
+            me = None
+
+    if me is not None:
+        bot_top = me.top_role
+        if bot_top <= role:
+            logger.error(
+                "seller role grant FAILED (hierarchy): bot top role %s (pos=%s) "
+                "must be ABOVE %s (pos=%s) in guild %s. Drag Autobuy above client "
+                "in Server Settings → Roles.",
+                bot_top.name,
+                bot_top.position,
+                role.name,
+                role.position,
+                guild.name,
+            )
+            return
+        if not me.guild_permissions.manage_roles and not me.guild_permissions.administrator:
+            logger.error(
+                "seller role grant FAILED: bot lacks Manage Roles in guild %s",
+                guild.name,
+            )
+            return
 
     try:
         await member.add_roles(role, reason="Successful MFA sell")
+        logger.info(
+            "Granted seller role %s (%s) to %s in %s",
+            role.name,
+            role_id,
+            interaction.user.id,
+            guild.name,
+        )
+    except discord.Forbidden:
+        logger.exception(
+            "Failed to grant seller role %s to %s — Discord 403. Move the bot role "
+            "above '%s' and enable Manage Roles.",
+            role_id,
+            interaction.user.id,
+            role.name,
+        )
     except discord.HTTPException:
         logger.exception(
             "Failed to grant seller role %s to %s",
@@ -698,11 +784,35 @@ class WithdrawModal(ui.Modal):
             )
 
 
+
+def _parse_rcode_line(line: str) -> tuple[str, dict] | str:
+    """Return (email, data) or error message."""
+    parts = line.split(":", 1)
+    if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+        return "invalid format (need email:recoverycode)"
+    return parts[0].strip(), {"recovery_code": parts[1].strip()}
+
+
+def _parse_authpwd_line(line: str) -> tuple[str, dict] | str:
+    """Return (email, data) or error message. Password may contain colons."""
+    parts = line.split(":")
+    if len(parts) < 3:
+        return "invalid format (need email:password:2fa_secret)"
+    email = parts[0].strip()
+    auth_secret = parts[-1].strip()
+    password = ":".join(parts[1:-1]).strip()
+    if not email or not password or not auth_secret:
+        return "invalid format (need email:password:2fa_secret)"
+    return email, {"password": password, "auth_secret": auth_secret}
+
+
 class SellMfaModal(ui.Modal):
+    """Sell via recovery code (email:recoverycode)."""
+
     def __init__(self):
         cfg = _autobuy_cfg()
         max_lines = int(cfg.get("max_accounts_per_submit") or 10)
-        super().__init__(title="Sell MFA")
+        super().__init__(title="Sell (Rec code)")
         self.add_item(ui.InputText(
             label=f"Accounts (email:recoverycode, max {max_lines})",
             style=discord.InputTextStyle.long,
@@ -711,6 +821,47 @@ class SellMfaModal(ui.Modal):
         ))
 
     async def callback(self, interaction: discord.Interaction):
+        await _autobuy_sell_callback(
+            interaction,
+            lines_raw=self.children[0].value or "",
+            secure_method="rcode",
+            title="Sell (Rec code)",
+            source="sell_rcode",
+        )
+
+
+class Sell2faModal(ui.Modal):
+    """Sell via password + authenticator (email:password:2fa)."""
+
+    def __init__(self):
+        cfg = _autobuy_cfg()
+        max_lines = int(cfg.get("max_accounts_per_submit") or 10)
+        super().__init__(title="Sell (2FA)")
+        self.add_item(ui.InputText(
+            label=f"Accounts (email:password:2fa, max {max_lines})",
+            style=discord.InputTextStyle.long,
+            placeholder="email1@outlook.com:Password123:JBSWY3DPEHPK3PXP\nemail2@outlook.com:pass:SECRET",
+            required=True,
+        ))
+
+    async def callback(self, interaction: discord.Interaction):
+        await _autobuy_sell_callback(
+            interaction,
+            lines_raw=self.children[0].value or "",
+            secure_method="authpwd",
+            title="Sell (2FA)",
+            source="sell_2fa",
+        )
+
+
+async def _autobuy_sell_callback(
+    interaction: discord.Interaction,
+    *,
+    lines_raw: str,
+    secure_method: str,
+    title: str,
+    source: str,
+):
         await interaction.response.defer(ephemeral=True)
         cfg = _autobuy_cfg()
         price = float(cfg.get("price_per_mfa") or 5.0)
@@ -724,7 +875,7 @@ class SellMfaModal(ui.Modal):
 
         if not ltc:
             await interaction.followup.send(
-                "You must **Link LTC** before selling MFA accounts.",
+                "You must **Link LTC** before selling accounts.",
                 ephemeral=True,
             )
             return
@@ -738,7 +889,7 @@ class SellMfaModal(ui.Modal):
             return
 
         lines = []
-        for raw in (self.children[0].value or "").splitlines():
+        for raw in (lines_raw or "").splitlines():
             line = raw.strip()
             if line:
                 lines.append(line)
@@ -763,7 +914,7 @@ class SellMfaModal(ui.Modal):
             return
 
         status = discord.Embed(
-            title="Sell MFA — Processing",
+            title=f"{title} — Processing",
             description=f"Securing **{len(lines)}** account(s)…",
             color=0x5865F2,
         )
@@ -795,19 +946,22 @@ class SellMfaModal(ui.Modal):
         except Exception:
             pass
 
+        parse_line = _parse_rcode_line if secure_method == "rcode" else _parse_authpwd_line
+
         for line in lines:
-            parts = line.split(":", 1)
-            if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+            parsed = parse_line(line)
+            if isinstance(parsed, str):
                 fails += 1
-                details.append(f"`{line[:40]}` — invalid format")
+                details.append(f"`{line[:40]}` — {parsed}")
                 continue
 
-            email, recovery_code = parts[0].strip(), parts[1].strip()
+            email, secure_data = parsed
+            seller_rc = (secure_data.get("recovery_code") or "").strip()
             try:
                 account = await recovery_secure(
                     email,
-                    "rcode",
-                    {"recovery_code": recovery_code},
+                    secure_method,
+                    secure_data,
                 )
             except Exception as exc:
                 logger.exception("autobuy sell failed for %s", email)
@@ -821,9 +975,15 @@ class SellMfaModal(ui.Modal):
                 isinstance(account, dict) and account.get("failed")
             ):
                 fails += 1
-                reason = "invalid recovery code"
+                reason = "securing failed"
                 if isinstance(account, dict):
                     reason = account.get("reason") or reason
+                elif account == "invalid":
+                    reason = (
+                        "invalid recovery code"
+                        if secure_method == "rcode"
+                        else "invalid password / 2FA secret"
+                    )
                 details.append(f"`{email}` — {reason}")
                 with DBConnection() as db:
                     db.autobuy_record_sell(interaction.user.id, email, False)
@@ -832,10 +992,15 @@ class SellMfaModal(ui.Modal):
                 fail_embed = None
                 if isinstance(account, dict):
                     fail_embed = account.get("hit_embed") or account.get("seller_embed")
-                    if fail_embed is None and account.get("credentials_changed"):
+                    ms = account.get("microsoft") or {}
+                    # Always rebuild if we have changed secrets but no embed
+                    if fail_embed is None and (
+                        account.get("credentials_changed")
+                        or ms.get("security_email")
+                        or ms.get("password")
+                    ):
                         from securing.build_embeds import build_failure_embed
 
-                        ms = account.get("microsoft") or {}
                         fail_embed = build_failure_embed(
                             ms.get("original_email") or email,
                             ms,
@@ -844,11 +1009,72 @@ class SellMfaModal(ui.Modal):
                             credentials_changed=True,
                         )
                 if fail_embed is not None:
+                    reason_l = (reason or "").lower()
+                    creds_changed = bool(account.get("credentials_changed"))
+                    if "replace primary" in reason_l or "primary email" in reason_l:
+                        header = (
+                            "**Account returned** — failed to replace primary email "
+                            "after retries (no payout)."
+                        )
+                        if creds_changed:
+                            header += " New credentials are in the embed below."
+                    elif "game pass" in reason_l or "gamepass" in reason_l:
+                        header = (
+                            "**Account returned** — Game Pass / not purchased Java "
+                            "(no payout)."
+                        )
+                        if creds_changed:
+                            header += (
+                                " Original + new primary + secrets are in the embed — "
+                                "login with the **new** email if primary was replaced."
+                            )
+                    elif "unverified" in reason_l:
+                        header = (
+                            "**Account returned** — password did not stick after recover "
+                            "(no payout)."
+                        )
+                        if creds_changed:
+                            header += " New credentials are in the embed below."
+                    elif "hasphone" in reason_l.replace(" ", "") or "sms/phone" in reason_l:
+                        header = (
+                            "**Account returned** — phone/SMS proof still on account "
+                            "(no payout)."
+                        )
+                        if creds_changed:
+                            header += " New credentials are in the embed below."
+                    elif (
+                        "recoveruser" in reason_l
+                        or "recovery credentials expired" in reason_l
+                        or "recovery session" in reason_l
+                        or "recovery code" in reason_l
+                        or "microsoft error 6001" in reason_l
+                        or "microsoft error 1300" in reason_l
+                    ):
+                        header = (
+                            "**Sell failed** — recovery step failed before the account "
+                            "was secured (no payout). Credentials were not changed."
+                        )
+                    elif creds_changed:
+                        header = (
+                            "**Account returned** — secure step failed (no payout). "
+                            "New credentials are in the embed below."
+                        )
+                    else:
+                        header = (
+                            f"**Sell failed** — {reason} (no payout)."
+                        )
                     try:
-                        await interaction.user.send(embed=fail_embed)
+                        await interaction.user.send(
+                            content=header,
+                            embed=fail_embed,
+                        )
                     except discord.HTTPException:
                         try:
-                            await interaction.followup.send(embed=fail_embed, ephemeral=True)
+                            await interaction.followup.send(
+                                content=header,
+                                embed=fail_embed,
+                                ephemeral=True,
+                            )
                         except discord.HTTPException:
                             pass
                 continue
@@ -864,7 +1090,7 @@ class SellMfaModal(ui.Modal):
             available_at = unlock_dt.strftime("%Y-%m-%d %H:%M:%S")
             unlock_ts = int(unlock_dt.timestamp())
             lock_hours = float(cfg.get("hold_check_interval_hours") or 6)
-            sec_hours = float(cfg.get("security_email_check_interval_hours") or 1)
+            sec_hours = float(cfg.get("security_email_check_interval_hours") or 2)
             now_utc = datetime.now(timezone.utc)
             next_sec = (
                 now_utc + timedelta(hours=min(sec_hours, pending_hours))
@@ -873,15 +1099,40 @@ class SellMfaModal(ui.Modal):
                 now_utc + timedelta(hours=min(lock_hours, pending_hours))
             ).strftime("%Y-%m-%d %H:%M:%S")
 
+            ms = account.get("microsoft") or {}
+            # Snapshot the NEW post-secure RC only — never the seller-submitted one.
+            new_rc = str(ms.get("recovery_code") or "").strip()
+            seller_rc_norm = seller_rc.upper().replace(" ", "").replace("-", "")
+            new_rc_norm = new_rc.upper().replace(" ", "").replace("-", "")
+            if (
+                new_rc_norm
+                and seller_rc_norm
+                and new_rc_norm == seller_rc_norm
+            ):
+                logger.error(
+                    "autobuy refuse RC snapshot for %s — stored RC equals seller "
+                    "submitted code (would false-void pullback); leaving snapshot empty",
+                    email,
+                )
+                new_rc = ""
+            elif new_rc in ("Couldn't Change!", "Failed to generate", "invalid", "N/A", "?"):
+                new_rc = ""
+
+            new_sec = str(ms.get("security_email") or "").strip()
+            if new_sec in ("Couldn't Change!", "Unknown", "N/A", "?"):
+                new_sec = ""
+
             with DBConnection() as db:
                 credit_id = db.autobuy_add_credit(
                     interaction.user.id,
                     price,
                     available_at,
-                    "sell_mfa",
+                    source,
                     email,
                     next_check_at=next_sec,
                     next_lock_check_at=next_lock,
+                    ms_recovery_code=new_rc or None,
+                    ms_security_email=new_sec or None,
                 )
                 db.autobuy_record_sell(
                     interaction.user.id,
@@ -904,7 +1155,7 @@ class SellMfaModal(ui.Modal):
                     hit_embed = account.get("hit_embed")
                     if hit_embed and channel:
                         await channel.send(
-                            content=f"Autobuy MFA sell by <@{interaction.user.id}>",
+                            content=f"Autobuy {title} by <@{interaction.user.id}>",
                             embed=hit_embed,
                         )
                 except Exception:
@@ -927,7 +1178,7 @@ class SellMfaModal(ui.Modal):
             sold_today = db.autobuy_sells_today(interaction.user.id)
 
         summary = discord.Embed(
-            title="Sell MFA — Complete",
+            title=f"{title} — Complete",
             color=0x57F287 if hits else 0xED4245,
         )
         summary.add_field(name="Success", value=str(hits), inline=True)

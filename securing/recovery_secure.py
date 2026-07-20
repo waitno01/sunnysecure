@@ -186,14 +186,21 @@ async def _secure_after_password_login(
         print(f"[X] - Rejected account: {reject}")
         logging.warning("Rejected secured account %s: %s", email, reject)
         secured_ms = (secured or {}).get("microsoft") or {}
+        # Prefer post-secure secrets (authoritative) over pre-secure rextra
         return _failure_result(
             email,
             reject,
-            security_email=rextra.get("security_email"),
-            password=password,
-            recovery_code=rextra.get("recovery_code"),
+            security_email=(
+                secured_ms.get("security_email")
+                or rextra.get("security_email")
+            ),
+            password=secured_ms.get("password") or password,
+            recovery_code=(
+                secured_ms.get("recovery_code")
+                or rextra.get("recovery_code")
+            ),
             credentials_changed=True,
-            primary_email=secured_ms.get("email"),
+            primary_email=secured_ms.get("email") or email,
         )
 
     from securing.ban_checks import apply_ban_checks
@@ -206,11 +213,17 @@ async def _secure_after_password_login(
         return _failure_result(
             email,
             ban_reject,
-            security_email=rextra.get("security_email"),
-            password=password,
-            recovery_code=rextra.get("recovery_code"),
+            security_email=(
+                secured_ms.get("security_email")
+                or rextra.get("security_email")
+            ),
+            password=secured_ms.get("password") or password,
+            recovery_code=(
+                secured_ms.get("recovery_code")
+                or rextra.get("recovery_code")
+            ),
             credentials_changed=True,
-            primary_email=secured_ms.get("email"),
+            primary_email=secured_ms.get("email") or email,
         )
 
     account_id = uuid.uuid4().hex
@@ -232,18 +245,28 @@ def _failure_result(
     fallback_password: bool = False,
     credentials_changed: bool = False,
     primary_email: str | None = None,
+    primary_alias_replaced: bool | None = None,
 ) -> dict:
     # Only surface generated password/security email when RecoverUser actually succeeded
     # (or a later step failed after password change). Otherwise they mislead sellers.
     # On give-back after primary replace, pass primary_email so sellers get sunny@.
-    current_primary = (primary_email or "").strip() or email
+    original = (email or "").strip()
+    current_primary = (primary_email or "").strip() or original
+    replaced = primary_alias_replaced
+    if replaced is None:
+        replaced = bool(
+            current_primary
+            and original
+            and current_primary.lower() != original.lower()
+        )
     if credentials_changed:
         ms = {
             "email": current_primary,
             "security_email": security_email or "Couldn't Change!",
             "password": password or "Couldn't Change!",
             "recovery_code": recovery_code or "Couldn't Change!",
-            "original_email": email,
+            "original_email": original,
+            "primary_alias_replaced": replaced,
         }
     else:
         ms = {
@@ -251,7 +274,8 @@ def _failure_result(
             "security_email": "Couldn't Change!",
             "password": "Couldn't Change!",
             "recovery_code": recovery_code or "Couldn't Change!",
-            "original_email": email,
+            "original_email": original,
+            "primary_alias_replaced": replaced,
         }
     detail = error or reason
     # Failure = account returned: include new primary when already changed.
@@ -452,14 +476,42 @@ async def recovery_secure(
                 if pwd_status == "ok":
                     print("[+] - Password verified OK")
                 elif pwd_status == "bad":
-                    print("[!] - Password did NOT stick — login will use security-email OTP")
+                    # Do NOT hammer RecoverUser here — it burns rate-limits, delays
+                    # OTP mail, and still leaves password UNVERIFIED. Fix after OTP
+                    # via authenticated ChangePassword / ResetPassword.
+                    password = f"{password} (UNVERIFIED — may not work)"
+                    print(
+                        "[!] - Password did NOT stick after RecoverUser — "
+                        "skipping force retries; OTP then ChangePassword"
+                    )
                     logging.error(
-                        "Password not applied for %s after RecoverUser — marking UNVERIFIED",
+                        "Password not applied for %s after RecoverUser — "
+                        "deferring fix until after OTP login",
                         email,
                     )
-                    password = f"{password} (UNVERIFIED — may not work)"
                 else:
-                    print("[~] - Password verify inconclusive (continuing)")
+                    # Inconclusive (rate-limit) — one longer settle before continuing.
+                    # Do NOT mark UNVERIFIED; post-login ensure_password_verified
+                    # will force if login later proves the password is bad.
+                    print("[~] - Password verify inconclusive — delayed re-check…")
+                    try:
+                        pwd_status2 = await verify_password_works(
+                            session, email, password, settle_delay=10.0
+                        )
+                    except Exception:
+                        pwd_status2 = "unknown"
+                    if pwd_status2 == "ok":
+                        pwd_status = "ok"
+                        print("[+] - Password verified OK on delayed re-check")
+                    elif pwd_status2 == "bad":
+                        password = f"{password} (UNVERIFIED — may not work)"
+                        pwd_status = "bad"
+                        print(
+                            "[!] - Delayed re-check BAD — "
+                            "OTP then authenticated ChangePassword"
+                        )
+                    else:
+                        print("[~] - Password verify still inconclusive (continuing)")
 
                 rextra = {
                     "security_email": security_email,
@@ -472,31 +524,62 @@ async def recovery_secure(
                 # poison later SA elevation; security-email OTP usually does not.
                 # Password is the fallback when OTP mail does not arrive (30s).
                 account = None
-                login_password = re.sub(
-                    r"\s*\(UNVERIFIED[^)]*\)\s*$", "", password or ""
-                ).strip()
+                from securing.utils.security.force_password import strip_unverified
+
+                login_password = strip_unverified(password)
 
                 async def _otp_login(s):
-                    info = await send_auth(s, email, security_email)
-                    flowtoken, auth_error = _flowtoken_from_auth(info)
-                    if auth_error:
-                        return _failure_result(
-                            email,
-                            auth_error,
-                            security_email=security_email,
-                            password=password,
-                            recovery_code=new_recovery_code,
-                            credentials_changed=True,
-                        )
+                    import time as _time
 
-                    print("[~] - Getting email code (OTP-first, 30s)...")
-                    code = await get_email_code(security_email, timeout=30)
-                    print(f"Got code - {code}")
+                    # Initial OTP request + one resend if mail is slow.
+                    # Longer waits — RecoverUser traffic often delays security mail.
+                    # Only after both waits miss do we fall back to password.
+                    max_otp_rounds = 2
+                    otp_timeout_s = 45
+                    code = None
+                    flowtoken = None
+                    last_auth_error = None
+
+                    for round_i in range(1, max_otp_rounds + 1):
+                        info = await send_auth(s, email, security_email)
+                        flowtoken, auth_error = _flowtoken_from_auth(info)
+                        if auth_error:
+                            last_auth_error = auth_error
+                            # Authenticator / no email proof — don't burn OTP waits
+                            return _failure_result(
+                                email,
+                                auth_error,
+                                security_email=security_email,
+                                password=password,
+                                recovery_code=new_recovery_code,
+                                credentials_changed=True,
+                            )
+
+                        since = _time.time()
+                        print(
+                            f"[~] - Getting email code (OTP round {round_i}/"
+                            f"{max_otp_rounds}, {otp_timeout_s}s)..."
+                        )
+                        code = await get_email_code(
+                            security_email, timeout=otp_timeout_s, since=since
+                        )
+                        print(f"Got code - {code}")
+                        if code:
+                            break
+                        if round_i < max_otp_rounds:
+                            print(
+                                f"[!] - OTP not received in {otp_timeout_s}s — "
+                                "requesting another code..."
+                            )
 
                     if not code:
                         return _failure_result(
                             email,
-                            "Timed out waiting for OTP at the new security email.",
+                            last_auth_error
+                            or (
+                                f"Timed out waiting for OTP after {max_otp_rounds} "
+                                "sends at the new security email."
+                            ),
                             security_email=security_email,
                             password=password,
                             recovery_code=new_recovery_code,
@@ -559,9 +642,29 @@ async def recovery_secure(
                     and account.get("fallback_password")
                     and login_password
                 ):
-                    # Always try password after OTP timeout — verify can be flaky
-                    # (bad/unknown/UNVERIFIED) right after RecoverUser even when
-                    # the new password actually works.
+                    # Skip password fallback when verify already proved BAD —
+                    # that only burns attempts and yields "no MSAAUTH".
+                    if pwd_status == "bad" or "UNVERIFIED" in str(password):
+                        logging.warning(
+                            "OTP failed for %s and password is UNVERIFIED/bad — "
+                            "not attempting password login",
+                            email,
+                        )
+                        print(
+                            "[!] - Security-email OTP failed; password verify was "
+                            f"{pwd_status} — returning creds (no password login)"
+                        )
+                        return _failure_result(
+                            email,
+                            "Security-email OTP did not arrive and password did not "
+                            "stick after RecoverUser. Use the recovery code below "
+                            "to sign in / reset, then resubmit if needed.",
+                            security_email=security_email,
+                            password=password,
+                            recovery_code=new_recovery_code,
+                            credentials_changed=True,
+                        )
+
                     logging.warning(
                         "OTP path failed for %s (%s) — falling back to password login"
                         " (pwd_status=%s)",
@@ -570,7 +673,7 @@ async def recovery_secure(
                         pwd_status,
                     )
                     print(
-                        "[!] - Security-email OTP did not arrive in time; "
+                        "[!] - Security-email OTP failed after resend; "
                         f"falling back to password login (verify={pwd_status})..."
                     )
                     await close_session(session)
@@ -691,6 +794,9 @@ async def recovery_secure(
                 await close_session(session)
             
         case "authpwd":
+            # Password + authenticator TOTP login, then secure(recovery=True)
+            # which mints RC → RecoverUser (new pwd / security email).
+            # Parity with rcode: proxy retry, filters, ban checks, give-back, session close.
             lock_reason = await get_account_lock_reason(email)
             if lock_reason:
                 return _failure_result(
@@ -699,35 +805,192 @@ async def recovery_secure(
                     error=lock_reason,
                 )
 
-            response = await login_authenticator(
-                session=session,
-                email=email,
-                data=data,
-            )
-
-            if response is not True:
-                reason = response if isinstance(response, str) and response else "invalid credentials"
+            seller_password = (data.get("password") or "").strip()
+            auth_secret = (data.get("auth_secret") or "").strip()
+            if not seller_password or not auth_secret:
                 return _failure_result(
                     email,
-                    reason if reason != "invalid" else "invalid credentials",
-                    password=data.get("password"),
-                    error=reason,
+                    "Missing password or authenticator secret",
+                    error="missing authpwd fields",
                 )
 
-            dsecured = await secure(
-                session=session,
-                recovery=True,
-                account_info=account,
-                command=True,
-            )
+            try:
+                async def _totp_login(s):
+                    result = await login_authenticator(
+                        session=s,
+                        email=email,
+                        data={"password": seller_password, "auth_secret": auth_secret},
+                    )
+                    if result is not True:
+                        reason = (
+                            result
+                            if isinstance(result, str) and result
+                            else "invalid credentials"
+                        )
+                        return _failure_result(
+                            email,
+                            reason if reason != "invalid" else "invalid credentials",
+                            password=seller_password,
+                            error=reason,
+                        )
+                    return True
 
-    logging.info(f"Account: {dsecured}")
+                login_ok, session = await run_with_proxy_retry(
+                    session,
+                    _totp_login,
+                    new_session=get_session,
+                    attempts=4,
+                    rotate_ssid_after=2,
+                    label="authpwd-login",
+                    email=email,
+                )
+                if isinstance(login_ok, dict) and login_ok.get("failed"):
+                    return login_ok
 
-    final_time = (time() - initialTime)
+                print("[~] - Authenticator login OK — securing account…")
+                try:
+                    dsecured = await secure(
+                        session=session,
+                        recovery=True,
+                        account_info=account,
+                        command=True,
+                    )
+                except Exception as exc:
+                    logging.exception("authpwd secure() crashed for %s", email)
+                    ms = (account.get("microsoft") or {})
+                    primary = str(ms.get("email") or "").strip() or email
+                    replaced = ms.get("primary_alias_replaced") is True or (
+                        primary.lower() != email.lower()
+                    )
+                    creds_changed = (
+                        bool(
+                            ms.get("recovery_code")
+                            and ms.get("recovery_code")
+                            not in ("Couldn't Change!", "Failed to generate", None)
+                        )
+                        or bool(
+                            ms.get("security_email")
+                            and ms.get("security_email") not in ("Couldn't Change!", None)
+                        )
+                        or replaced
+                    )
+                    reason = str(exc).strip() or exc.__class__.__name__
+                    if is_proxy_transport_error(exc):
+                        reason = (
+                            f"Network/proxy error ({exc.__class__.__name__}). "
+                            "Retry securing — credentials may already have changed."
+                        )
+                    return _failure_result(
+                        email,
+                        f"Securing step failed: {reason}",
+                        security_email=ms.get("security_email") if creds_changed else None,
+                        password=ms.get("password") if creds_changed else seller_password,
+                        recovery_code=ms.get("recovery_code") if creds_changed else None,
+                        error=f"{exc.__class__.__name__}: {exc}",
+                        credentials_changed=creds_changed,
+                        primary_email=primary,
+                        primary_alias_replaced=replaced,
+                    )
 
-    account_id = uuid.uuid4().hex
-    with DBConnection() as database:
-        database.add_secured_account(account_id, dsecured)
+                if not dsecured or not isinstance(dsecured, dict):
+                    ms = (account.get("microsoft") or {})
+                    primary = str(ms.get("email") or "").strip() or email
+                    replaced = ms.get("primary_alias_replaced") is True
+                    return _failure_result(
+                        email,
+                        "Login or securing failed after authenticator login.",
+                        password=seller_password,
+                        error="secure() returned no account data",
+                        primary_email=primary,
+                        primary_alias_replaced=replaced,
+                        credentials_changed=replaced,
+                    )
 
-    build_account = await build_account_embeds(dsecured, final_time, account_id)
-    return build_account
+                ms = dsecured.get("microsoft") or {}
+                new_rc = str(ms.get("recovery_code") or "").strip()
+                new_sec = str(ms.get("security_email") or "").strip()
+                new_pwd = str(ms.get("password") or "").strip()
+                creds_ready = (
+                    new_rc
+                    and new_rc not in ("Couldn't Change!", "Failed to generate", "invalid")
+                    and new_sec
+                    and new_sec not in ("Couldn't Change!", "Unknown")
+                )
+                if creds_ready:
+                    await _notify_credentials(
+                        on_credentials,
+                        {
+                            "email": email,
+                            "security_email": new_sec,
+                            "password": new_pwd,
+                            "recovery_code": new_rc,
+                        },
+                    )
+
+                reject = rejection_reason(dsecured)
+                if reject:
+                    print(f"[X] - Rejected account: {reject}")
+                    logging.warning("Rejected authpwd account %s: %s", email, reject)
+                    return _failure_result(
+                        email,
+                        reject,
+                        security_email=ms.get("security_email"),
+                        password=ms.get("password") or seller_password,
+                        recovery_code=ms.get("recovery_code"),
+                        credentials_changed=True,
+                        primary_email=ms.get("email") or email,
+                    )
+
+                from securing.ban_checks import apply_ban_checks
+
+                ban_reject = await apply_ban_checks(dsecured)
+                if ban_reject:
+                    print(f"[X] - Banned account: {ban_reject}")
+                    logging.warning("Ban-check rejected authpwd %s: %s", email, ban_reject)
+                    return _failure_result(
+                        email,
+                        ban_reject,
+                        security_email=ms.get("security_email"),
+                        password=ms.get("password") or seller_password,
+                        recovery_code=ms.get("recovery_code"),
+                        credentials_changed=True,
+                        primary_email=ms.get("email") or email,
+                    )
+
+                if not creds_ready:
+                    primary = str(ms.get("email") or "").strip() or email
+                    replaced = ms.get("primary_alias_replaced") is True or (
+                        primary.lower() != email.lower()
+                    )
+                    return _failure_result(
+                        email,
+                        "Securing failed — recovery code / security email were not set.",
+                        password=ms.get("password") or seller_password,
+                        recovery_code=ms.get("recovery_code"),
+                        security_email=ms.get("security_email"),
+                        error="authpwd secure did not produce new credentials",
+                        credentials_changed=replaced,
+                        primary_email=primary,
+                        primary_alias_replaced=replaced,
+                    )
+
+                final_time = time() - initialTime
+                account_id = uuid.uuid4().hex
+                with DBConnection() as database:
+                    database.add_secured_account(account_id, dsecured)
+                return await build_account_embeds(dsecured, final_time, account_id)
+            except Exception as exc:
+                logging.exception("recovery_secure authpwd failed for %s", email)
+                if is_proxy_transport_error(exc):
+                    return _failure_result(
+                        email,
+                        f"Network error during authenticator secure ({exc.__class__.__name__}). Retry.",
+                        password=seller_password,
+                        error=str(exc) or exc.__class__.__name__,
+                    )
+                raise
+            finally:
+                await close_session(session)
+
+    logging.error("recovery_secure unknown method=%s email=%s", method, email)
+    return _failure_result(email, f"Unknown secure method: {method}")

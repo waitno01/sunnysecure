@@ -79,20 +79,37 @@ function extractBanId(text) {
   return m ? m[1] : null;
 }
 
+function isDiscordSecurityKick(text) {
+  // DonutSMP Discord anti-proxy / verify prompt — NOT a ban
+  const lower = String(text || '').toLowerCase();
+  return (
+    lower.includes('unauthorized login') ||
+    lower.includes('possible unauthorized') ||
+    lower.includes('confirm it via the button in your discord') ||
+    lower.includes('direct messages enabled in the donutsmp') ||
+    lower.includes('make sure you are verified on the discord') ||
+    (lower.includes('for your own safety') && lower.includes('blocked it'))
+  );
+}
+
 function isBanMessage(text) {
   const lower = String(text || '').toLowerCase();
   if (!lower) return false;
+  if (isDiscordSecurityKick(text)) return false;
   if (extractBanId(text)) return true;
   return (
-    /\bbanned\b/.test(lower) ||
+    /\byou (are|have been)\s+(temporarily\s+)?banned\b/.test(lower) ||
+    /\btemporarily banned\b/.test(lower) ||
+    /\bpermanently banned\b/.test(lower) ||
     /\bban\s*id\b/.test(lower) ||
     /\bterminated\b/.test(lower) ||
-    /\bblocked\b/.test(lower) ||
     /\bblacklist/.test(lower) ||
     lower.includes('you are permanently') ||
-    lower.includes('you have been banned') ||
-    lower.includes('your account has been') ||
-    lower.includes('security ban')
+    lower.includes('your account has been banned') ||
+    lower.includes('security ban') ||
+    // Real account blocks — not "we've blocked it" Discord verify prompts
+    /\b(your )?account (has been|is) blocked\b/.test(lower) ||
+    /\bblocked from (this|the) server\b/.test(lower)
   );
 }
 
@@ -161,7 +178,14 @@ function fetchProfile(token) {
         res.on('end', () => {
           try {
             const j = JSON.parse(body || '{}');
-            if (!j.name || !j.id) return reject(new Error('No Java profile on this SSID'));
+            if (!j.name || !j.id) {
+              const err = j.error || j.errorMessage || body.slice(0, 120) || 'empty';
+              return reject(
+                new Error(
+                  `No Java profile on this SSID (http=${res.statusCode}: ${err})`
+                )
+              );
+            }
             resolve({ name: j.name, uuid: j.id });
           } catch (e) {
             reject(e);
@@ -173,6 +197,41 @@ function fetchProfile(token) {
     req.on('timeout', () => {
       req.destroy();
       reject(new Error('profile fetch timeout'));
+    });
+    req.end();
+  });
+}
+
+function fetchUuidFromMojang(name) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: 'api.mojang.com',
+        path: `/users/profiles/minecraft/${encodeURIComponent(name)}`,
+        method: 'GET',
+        timeout: 15000,
+      },
+      (res) => {
+        let body = '';
+        res.on('data', (c) => (body += c));
+        res.on('end', () => {
+          if (res.statusCode !== 200) {
+            return reject(new Error(`Mojang UUID lookup http=${res.statusCode}`));
+          }
+          try {
+            const j = JSON.parse(body || '{}');
+            if (!j.id) return reject(new Error('Mojang UUID lookup empty id'));
+            resolve(j.id);
+          } catch (e) {
+            reject(e);
+          }
+        });
+      }
+    );
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Mojang UUID lookup timeout'));
     });
     req.end();
   });
@@ -306,7 +365,10 @@ function attemptConnect({ host, port, token, name, uuid, proxy, timeoutMs }) {
       lastDisconnectReason = reason;
       const text = formatKick(reason);
       const banId = extractBanId(text);
-      if (isBanMessage(text)) {
+      if (isDiscordSecurityKick(text)) {
+        // Discord verify / unauthorized-login prompt — account is not banned
+        done({ status: 'ok', reason: 'discord_security_prompt_not_ban' });
+      } else if (isBanMessage(text)) {
         done({ status: 'banned', reason: text, ban_id: banId });
       } else {
         done({ status: 'error', reason: text || 'kicked' });
@@ -319,7 +381,9 @@ function attemptConnect({ host, port, token, name, uuid, proxy, timeoutMs }) {
         if (settled) return;
         const prefer = lastDisconnectReason != null ? lastDisconnectReason : reason;
         const text = formatKick(prefer);
-        if (isBanMessage(text)) {
+        if (isDiscordSecurityKick(text)) {
+          done({ status: 'ok', reason: 'discord_security_prompt_not_ban' });
+        } else if (isBanMessage(text)) {
           done({
             status: 'banned',
             reason: text || 'disconnected (ban)',
@@ -355,9 +419,31 @@ async function main() {
 
   try {
     if (!name || !uuid) {
-      const profile = await fetchProfile(token);
-      name = name || profile.name;
-      uuid = uuid || profile.uuid;
+      try {
+        const profile = await fetchProfile(token);
+        name = name || profile.name;
+        uuid = uuid || profile.uuid;
+      } catch (e) {
+        // SSID profile endpoint often flakes; if we already have an IGN, resolve UUID
+        if (name && !uuid) {
+          uuid = await fetchUuidFromMojang(name);
+        } else {
+          throw e;
+        }
+      }
+    }
+    if (name && !uuid) {
+      uuid = await fetchUuidFromMojang(name);
+    }
+    if (!name || !uuid) {
+      console.log(
+        JSON.stringify({
+          status: 'error',
+          reason: 'No Java profile/UUID for ban check',
+          attempts: 0,
+        })
+      );
+      process.exit(0);
     }
   } catch (e) {
     console.log(

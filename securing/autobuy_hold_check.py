@@ -1,9 +1,15 @@
 """Periodic hold checks for autobuy credits.
 
-Two independent schedules:
-  • Security-email (pullback) — hourly via GetCredentialType proofs only
-    (no password login, no OTP send).
-  • Lock / suspended — every hold_check_interval_hours (default 6h).
+Only runs while a credit is still in its pending grace window
+(``now < available_at``, usually 12h after submit). Once grace ends the credit
+is cleared for withdraw with no further Microsoft probes (minimizes lock risk).
+
+Two independent schedules (grace only):
+  • Validity / pullback — every security_email_check_interval_hours (default 2h):
+      1) VerifyRecoveryCode only (read-only; never RecoverUser / password login)
+      2) If RC invalid or missing → GetCredentialType security-email proof check
+  • Lock / suspended — first check at hold_check_interval_hours (default 6h),
+    second check hold_check_second_interval_hours later (default 5h50m).
 """
 
 from __future__ import annotations
@@ -102,7 +108,7 @@ def _any_domain_proof(proofs: list, domain: str) -> bool:
 
 
 async def fetch_credential_type(email: str) -> dict | None:
-    """Read-only GetCredentialType — never sends an OTP.
+    """Read-only GetCredentialType — never sends an OTP or password.
 
     Needs a fresh PPFT/flowToken from login.live.com (empty token often omits Credentials).
     """
@@ -177,6 +183,83 @@ async def fetch_credential_type(email: str) -> dict | None:
                 pass
 
 
+def _usable_recovery_code(value: str | None) -> str | None:
+    rc = (value or "").strip().upper().replace(" ", "")
+    if not rc or rc in ("INVALID", "COULDN'T CHANGE!", "COULDNT CHANGE!", "N/A", "UNKNOWN"):
+        return None
+    # MS recovery codes are 5x5 groups; allow bare 25-char too
+    compact = rc.replace("-", "")
+    if len(compact) < 20:
+        return None
+    return rc
+
+
+async def check_pullback_intact(
+    email: str,
+    *,
+    recovery_code: str | None = None,
+    expected_security_email: str | None = None,
+    domain: str | None = None,
+) -> tuple[str, str | None]:
+    """Return (ok|partial|bad|unknown, reason) for hold pullback / validity.
+
+    Same workflow as dashboard Check Validation (no password at any point):
+      1) Read-only VerifyRecoveryCode with stored NEW post-secure RC
+      2) If RC invalid or missing → security-email GetCredentialType proof match
+      3) Never RecoverUser / SubmitRecovery / password login
+
+    Status meaning:
+      ok       — recovery code still valid
+      partial  — RC invalid/missing but security email still present (do not void)
+      bad      — RC invalid/missing AND security email gone/replaced (void)
+      unknown  — inconclusive (retry later; do not void)
+    """
+    rc = _usable_recovery_code(recovery_code)
+    rc_bad_reason: str | None = None
+
+    if rc:
+        try:
+            from securing.utils.security.recovery import check_recovery_code_valid
+        except Exception:
+            return "unknown", "recovery check helper unavailable"
+        status, reason = await check_recovery_code_valid(email, rc)
+        if status == "ok":
+            return "ok", None
+        if status == "unknown":
+            return "unknown", reason or "Recovery code check inconclusive"
+        # RC bad → fall through to security email (same as dashboard)
+        rc_bad_reason = reason or "Stored recovery code no longer valid"
+    else:
+        rc_bad_reason = "No usable recovery code stored"
+
+    email_status, email_reason = await check_security_email_intact(
+        email,
+        expected_security_email,
+        domain=domain,
+    )
+
+    if email_status == "ok":
+        return (
+            "partial",
+            (
+                f"RC invalid ({rc_bad_reason}); security email still present"
+                if rc
+                else "No recovery code; security email still present"
+            ),
+        )
+
+    if email_status == "unknown":
+        return "unknown", email_reason or "Security email check inconclusive"
+
+    return (
+        "bad",
+        (
+            f"RC invalid ({rc_bad_reason}); security email also missing/replaced "
+            f"({email_reason})"
+        ),
+    )
+
+
 async def check_security_email_intact(
     email: str,
     expected_security_email: str | None,
@@ -187,6 +270,7 @@ async def check_security_email_intact(
 
     Confirms the sold account still lists our security email on GetCredentialType
     (masked proofs supported). No password login / no OTP.
+    Used when recovery code is invalid or not stored.
     """
     email = (email or "").strip()
     if not email:
@@ -240,8 +324,8 @@ async def check_security_email_intact(
 
 
 async def check_sold_account(email: str, password: str | None = None) -> tuple[str, str | None]:
-    """Lock-only check. ``password`` kept for call-site compat."""
-    del password
+    """Lock-only check. Never verifies password (locks / rate-limits accounts)."""
+    del password  # intentionally unused — never password-check sold accounts
     if not (email or "").strip():
         return "unknown", "Missing email for lock check"
 
@@ -273,11 +357,19 @@ def _next_after(
 
 async def process_due_hold_checks(
     *,
-    security_interval_hours: float = 1.0,
+    security_interval_hours: float = 2.0,
     lock_interval_hours: float = 6.0,
+    lock_second_interval_hours: float = 5.0 + 50.0 / 60.0,
     limit: int = 20,
 ) -> dict:
-    """Run due security-email and/or lock checks. Returns {stats, void_events}."""
+    """Run due validity/lock checks only while credit is still in grace period.
+
+    After ``available_at`` (pending hours, usually 12h), clears for withdraw
+    without further Microsoft probes.
+
+    Lock schedule: first at ``lock_interval_hours`` from sell, then one more
+    after ``lock_second_interval_hours`` (default 5h50m), then stop.
+    """
     stats = {
         "checked": 0,
         "sec_checked": 0,
@@ -286,28 +378,57 @@ async def process_due_hold_checks(
         "voided": 0,
         "rescheduled": 0,
         "skipped": 0,
+        "partial": 0,
     }
     void_events: list[dict] = []
+    partial_events: list[dict] = []
     with DBConnection() as db:
         due = db.autobuy_credits_due_for_check(limit=limit)
 
     if not due:
-        return {"stats": stats, "void_events": void_events}
+        return {"stats": stats, "void_events": void_events, "partial_events": partial_events}
 
-    sec_hours = max(0.25, float(security_interval_hours))
-    lock_hours = max(1.0, float(lock_interval_hours))
+    # Validity (pullback) defaults to every 2h during grace only
+    sec_hours = max(0.25, float(security_interval_hours or 2.0))
+    lock_hours = max(1.0, float(lock_interval_hours or 6.0))
+    lock_second_hours = max(0.25, float(lock_second_interval_hours or (5.0 + 50.0 / 60.0)))
     now = _utc_now()
     domain = _load_domain()
 
     for row in due:
         credit_id = int(row["id"])
         email = (row.get("ms_email") or row.get("email") or "").strip()
-        expected_sec = (row.get("ms_security_email") or "").strip()
+        expected_sec = (
+            (row.get("pullback_security_email") or "").strip()
+            or (row.get("ms_security_email") or "").strip()
+        )
+        # NEW post-secure RC only (credit snapshot or secured_accounts by account_id).
+        # Never the seller-submitted recovery code from the sell modal.
+        stored_rc = (row.get("pullback_recovery_code") or "").strip()
+        rc_source = (row.get("pullback_rc_source") or "none").strip()
         discord_id = int(row["discord_id"])
         remaining = float(row.get("remaining_usd") or 0)
         available_at = _parse_ts(row.get("available_at"))
         next_sec_due = _parse_ts(row.get("next_check_at"))
         next_lock_due = _parse_ts(row.get("next_lock_check_at"))
+
+        # Grace over → clear for withdraw, do NOT probe Microsoft again
+        hold_elapsed = available_at is not None and available_at <= now
+        if hold_elapsed:
+            with DBConnection() as db:
+                db.autobuy_mark_credit_checked(
+                    credit_id,
+                    next_check_at=None,
+                    next_lock_check_at=None,
+                    clear=True,
+                )
+            stats["cleared"] += 1
+            logger.info(
+                "autobuy cleared credit=%s email=%s (grace ended — no further checks)",
+                credit_id,
+                email or "?",
+            )
+            continue
 
         run_sec = next_sec_due is None or next_sec_due <= now
         run_lock = next_lock_due is None or next_lock_due <= now
@@ -333,32 +454,50 @@ async def process_due_hold_checks(
 
         if run_sec:
             try:
-                status, reason = await check_security_email_intact(
+                status, reason = await check_pullback_intact(
                     email,
-                    expected_sec,
+                    recovery_code=stored_rc,
+                    expected_security_email=expected_sec,
                     domain=domain,
                 )
             except Exception:
                 logger.exception(
-                    "autobuy security-email check crashed credit=%s email=%s",
+                    "autobuy pullback check crashed credit=%s email=%s",
                     credit_id,
                     email,
                 )
-                status, reason = "unknown", "security-email check crashed"
+                status, reason = "unknown", "pullback check crashed"
 
             stats["sec_checked"] += 1
             stats["checked"] += 1
             if status == "bad":
-                void_reason = reason or "security email no longer intact"
+                void_reason = reason or "pullback check failed"
             elif status == "unknown":
-                new_sec_at = _fmt_ts(now + timedelta(hours=1))
+                new_sec_at = _fmt_ts(now + timedelta(hours=min(1.0, sec_hours)))
             else:
+                # ok or partial — keep holding; reschedule validity (default 2h)
                 new_sec_at = _fmt_ts(_next_after(now, sec_hours, available_at))
+                if status == "partial":
+                    stats["partial"] += 1
+                    partial_events.append(
+                        {
+                            "credit_id": credit_id,
+                            "discord_id": discord_id,
+                            "email": email,
+                            "amount_usd": remaining,
+                            "detail": reason
+                            or "Recovery code invalid; security email still present",
+                            "rc_source": rc_source,
+                            "available_at": _fmt_ts(available_at) if available_at else None,
+                        }
+                    )
                 logger.info(
-                    "autobuy security-email OK credit=%s email=%s expected=%s",
+                    "autobuy pullback %s credit=%s email=%s rc_source=%s detail=%s",
+                    status.upper(),
                     credit_id,
                     email,
-                    expected_sec or f"@{domain}",
+                    rc_source,
+                    reason or "recovery code valid",
                 )
 
         if void_reason is None and run_lock:
@@ -378,9 +517,26 @@ async def process_due_hold_checks(
             if status == "bad":
                 void_reason = reason or "failed lock check"
             elif status == "unknown":
-                new_lock_at = _fmt_ts(now + timedelta(hours=1))
+                new_lock_at = _fmt_ts(now + timedelta(hours=min(1.0, lock_hours)))
             else:
-                new_lock_at = _fmt_ts(_next_after(now, lock_hours, available_at))
+                # After a successful lock check: schedule one more after 5h50m
+                # if still inside grace; otherwise park at available_at (no more probes).
+                second_at = now + timedelta(hours=lock_second_hours)
+                if available_at and second_at < available_at:
+                    new_lock_at = _fmt_ts(second_at)
+                    logger.info(
+                        "autobuy lock OK credit=%s email=%s — next lock in %.2fh",
+                        credit_id,
+                        email,
+                        lock_second_hours,
+                    )
+                else:
+                    new_lock_at = _fmt_ts(available_at) if available_at else None
+                    logger.info(
+                        "autobuy lock OK credit=%s email=%s — no further lock checks before grace end",
+                        credit_id,
+                        email,
+                    )
 
         if void_reason:
             with DBConnection() as db:
@@ -389,10 +545,12 @@ async def process_due_hold_checks(
                 stats["voided"] += 1
                 void_events.append(
                     {
+                        "credit_id": credit_id,
                         "discord_id": discord_id,
                         "email": email,
                         "amount_usd": voided or remaining,
                         "reason": void_reason,
+                        "available_at": _fmt_ts(available_at) if available_at else None,
                     }
                 )
                 logger.warning(
@@ -402,19 +560,6 @@ async def process_due_hold_checks(
                     void_reason,
                     voided,
                 )
-            continue
-
-        hold_elapsed = available_at is not None and available_at <= now
-        if hold_elapsed:
-            with DBConnection() as db:
-                db.autobuy_mark_credit_checked(
-                    credit_id,
-                    next_check_at=None,
-                    next_lock_check_at=None,
-                    clear=True,
-                )
-            stats["cleared"] += 1
-            logger.info("autobuy cleared credit=%s email=%s", credit_id, email)
             continue
 
         # Preserve schedules for checks that did not run this pass
@@ -437,4 +582,8 @@ async def process_due_hold_checks(
             )
         stats["rescheduled"] += 1
 
-    return {"stats": stats, "void_events": void_events}
+    return {
+        "stats": stats,
+        "void_events": void_events,
+        "partial_events": partial_events,
+    }
